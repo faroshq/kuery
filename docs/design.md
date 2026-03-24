@@ -847,6 +847,7 @@ github.com/faroshq/kuery/
 - Go module, GORM models, auto-migrate
 - API types + codegen
 - Generic API server skeleton (POST-only Query)
+- Tests: GORM model unit tests (SQLite), API type serialization round-trip tests
 
 ### Phase 2 — Sync Controller
 - multicluster-runtime manager + kubeconfig provider
@@ -854,12 +855,14 @@ github.com/faroshq/kuery/
 - Informer event handlers → objects table upserts
 - Cluster engage/disengage lifecycle
 - CRD watch → discovery refresh
+- Tests: sync handler unit tests (upsert/delete against SQLite), discovery refresh tests, cluster lifecycle tests
 
 ### Phase 3 — Query Engine (basic)
 - SQL generator: single-level queries (filter, order, pagination)
 - Resource resolution via resource_types JOIN
 - Sparse projection via jsonb_build_object
 - Basic filters: groupKind, name, namespace, labels, conditions
+- Tests: SQL generator unit tests (verify generated SQL), end-to-end query tests against SQLite with seeded data, filter/order/pagination tests
 
 ### Phase 4 — Relations
 - Owner/descendant relation SQL generation
@@ -868,27 +871,32 @@ github.com/faroshq/kuery/
 - Event relations
 - BFS UNION ALL assembly with path column
 - Server-side tree reconstruction
+- Tests: relation traversal tests (ownerRef, spec-ref, selector), tree assembly tests, ref-path registry tests, Postgres integration tests via testcontainers
 
 ### Phase 5 — Transitive Relations
 - Recursive CTEs for `+` suffix relations
 - Cycle detection via visited UID array
 - Depth limits
+- Tests: transitive traversal tests (deep chains), cycle detection tests (circular ownerRefs), depth limit enforcement tests
 
 ### Phase 6 — Cross-Cluster & Annotations
 - Annotation-based explicit refs (`kuery.io/relates-to`)
 - Group label relations (`kuery.io/group`)
 - Cross-cluster traversal
+- Tests: cross-cluster relationship tests (multi-cluster seeded data), annotation parsing tests, group label matching tests
 
 ### Phase 7 — Hardening
 - Query timeouts and limits enforcement
 - Metrics and structured logging
 - Cluster health tracking and optional GC
 - CRD annotation-based custom ref-paths
+- Tests: timeout and limit enforcement tests, GC job tests, metrics emission tests, custom ref-path tests
 
 ### Phase 8 — kcp Support
 - kcp provider integration
 - APIExport identity in resource_types
 - kcp-specific discovery
+- Tests: identity-aware resource resolution tests, kcp discovery tests
 
 ## Decisions Log
 
