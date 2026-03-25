@@ -16,6 +16,8 @@ const (
 	RelSelects     = "selects"
 	RelSelectedBy  = "selected-by"
 	RelEvents      = "events"
+	RelLinked      = "linked"
+	RelGrouped     = "grouped"
 )
 
 // IsTransitive returns true if the relation name ends with "+".
@@ -53,6 +55,10 @@ func buildRelationJoin(relationType string, ctx relationContext) (string, []stri
 		return buildSelectedByJoin(ctx)
 	case RelEvents:
 		return buildEventsJoin(ctx)
+	case RelLinked:
+		return buildLinkedJoin(ctx)
+	case RelGrouped:
+		return buildGroupedJoin(ctx)
 	default:
 		// Unknown relation type — return empty (will produce no results).
 		return fmt.Sprintf("JOIN objects %s ON 1=0", ctx.childAlias), nil, nil
@@ -282,6 +288,73 @@ func buildEventsJoin(ctx relationContext) (string, []string, []any) {
 			ctx.childAlias, ctx.childAlias, ctx.parentAlias,
 			ctx.childAlias,
 			ctx.childAlias, ctx.parentAlias)
+	}
+	return join, nil, nil
+}
+
+// buildLinkedJoin: source → target via kuery.io/relates-to annotation.
+// Cross-cluster: target can be in any cluster.
+func buildLinkedJoin(ctx relationContext) (string, []string, []any) {
+	var join string
+	switch ctx.dialect {
+	case "postgres":
+		join = fmt.Sprintf(
+			"JOIN LATERAL jsonb_array_elements("+
+				"(%s.object->'metadata'->'annotations'->>'kuery.io/relates-to')::jsonb"+
+				") AS ref ON true "+
+				"JOIN objects %s ON %s.cluster = COALESCE(ref->>'cluster', %s.cluster) "+
+				"AND %s.api_group = COALESCE(ref->>'group', '') "+
+				"AND %s.kind = ref->>'kind' "+
+				"AND %s.namespace = COALESCE(ref->>'namespace', '') "+
+				"AND %s.name = ref->>'name'",
+			ctx.parentAlias,
+			ctx.childAlias, ctx.childAlias, ctx.parentAlias,
+			ctx.childAlias,
+			ctx.childAlias,
+			ctx.childAlias,
+			ctx.childAlias)
+	default: // sqlite
+		// The annotation value is a JSON array string stored in the annotations JSONB.
+		join = fmt.Sprintf(
+			"JOIN json_each(json_extract(%s.annotations, '$.\"kuery.io/relates-to\"')) ref ON 1=1 "+
+				"JOIN objects %s ON %s.cluster = COALESCE(json_extract(ref.value, '$.cluster'), %s.cluster) "+
+				"AND %s.api_group = COALESCE(json_extract(ref.value, '$.group'), '') "+
+				"AND %s.kind = json_extract(ref.value, '$.kind') "+
+				"AND %s.namespace = COALESCE(json_extract(ref.value, '$.namespace'), '') "+
+				"AND %s.name = json_extract(ref.value, '$.name')",
+			ctx.parentAlias,
+			ctx.childAlias, ctx.childAlias, ctx.parentAlias,
+			ctx.childAlias,
+			ctx.childAlias,
+			ctx.childAlias,
+			ctx.childAlias)
+	}
+	return join, nil, nil
+}
+
+// buildGroupedJoin: bidirectional grouping via kuery.io/group label.
+// Cross-cluster: matches objects in any cluster with the same group label.
+func buildGroupedJoin(ctx relationContext) (string, []string, []any) {
+	var join string
+	switch ctx.dialect {
+	case "postgres":
+		join = fmt.Sprintf(
+			"JOIN objects %s ON %s.labels->>'kuery.io/group' = %s.labels->>'kuery.io/group' "+
+				"AND %s.id != %s.id "+
+				"AND %s.labels->>'kuery.io/group' IS NOT NULL",
+			ctx.childAlias,
+			ctx.childAlias, ctx.parentAlias,
+			ctx.childAlias, ctx.parentAlias,
+			ctx.parentAlias)
+	default: // sqlite
+		join = fmt.Sprintf(
+			"JOIN objects %s ON json_extract(%s.labels, '$.\"kuery.io/group\"') = json_extract(%s.labels, '$.\"kuery.io/group\"') "+
+				"AND %s.id != %s.id "+
+				"AND json_extract(%s.labels, '$.\"kuery.io/group\"') IS NOT NULL",
+			ctx.childAlias,
+			ctx.childAlias, ctx.parentAlias,
+			ctx.childAlias, ctx.parentAlias,
+			ctx.parentAlias)
 	}
 	return join, nil, nil
 }

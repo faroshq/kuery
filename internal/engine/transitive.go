@@ -46,6 +46,9 @@ func buildTransitiveCTE(
 	case RelOwners:
 		baseJoinCond = ownerJoinCond(childAlias, parentAlias, dialect)
 		recursiveJoinCond = ownerJoinCond("next", cteName, dialect)
+	case RelLinked:
+		baseJoinCond = linkedJoinCond(childAlias, parentAlias, dialect)
+		recursiveJoinCond = linkedJoinCond("next", cteName, dialect)
 	default:
 		return nil, fmt.Errorf("unsupported transitive relation: %s", relationType)
 	}
@@ -256,5 +259,40 @@ func ownerJoinCond(childAlias, parentAlias, dialect string) string {
 	default: // sqlite
 		return fmt.Sprintf("%s.uid IN (SELECT json_extract(oref.value, '$.uid') FROM json_each(%s.owner_refs) oref)",
 			childAlias, parentAlias)
+	}
+}
+
+// linkedJoinCond returns the JOIN condition for annotation-based linked relations.
+// The parent has a kuery.io/relates-to annotation pointing to the child.
+func linkedJoinCond(childAlias, parentAlias, dialect string) string {
+	switch dialect {
+	case "postgres":
+		return fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM jsonb_array_elements((%s.object->'metadata'->'annotations'->>'kuery.io/relates-to')::jsonb) ref "+
+				"WHERE %s.cluster = COALESCE(ref->>'cluster', %s.cluster) "+
+				"AND %s.api_group = COALESCE(ref->>'group', '') "+
+				"AND %s.kind = ref->>'kind' "+
+				"AND %s.namespace = COALESCE(ref->>'namespace', '') "+
+				"AND %s.name = ref->>'name')",
+			parentAlias,
+			childAlias, parentAlias,
+			childAlias,
+			childAlias,
+			childAlias,
+			childAlias)
+	default: // sqlite
+		return fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM json_each(json_extract(%s.annotations, '$.\"kuery.io/relates-to\"')) ref "+
+				"WHERE %s.cluster = COALESCE(json_extract(ref.value, '$.cluster'), %s.cluster) "+
+				"AND %s.api_group = COALESCE(json_extract(ref.value, '$.group'), '') "+
+				"AND %s.kind = json_extract(ref.value, '$.kind') "+
+				"AND %s.namespace = COALESCE(json_extract(ref.value, '$.namespace'), '') "+
+				"AND %s.name = json_extract(ref.value, '$.name'))",
+			parentAlias,
+			childAlias, parentAlias,
+			childAlias,
+			childAlias,
+			childAlias,
+			childAlias)
 	}
 }
