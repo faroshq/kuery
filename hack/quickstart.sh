@@ -13,7 +13,7 @@ set -euo pipefail
 CLUSTER_1="kuery-alpha"
 CLUSTER_2="kuery-beta"
 KUBECONFIG_DIR="/tmp/kuery-quickstart"
-KUERY_PORT=6443
+KUERY_PORT=9443
 KUERY_PID=""
 
 RED='\033[0;31m'
@@ -243,17 +243,25 @@ KUERY_PID=$!
 
 # Wait for the server to be ready.
 log "Waiting for kuery API to be ready..."
+READY=false
 for i in $(seq 1 60); do
-    if curl -sk "https://localhost:${KUERY_PORT}/apis/kuery.io/v1alpha1" >/dev/null 2>&1; then
-        break
-    fi
     if ! kill -0 "${KUERY_PID}" 2>/dev/null; then
         echo "Error: kuery server exited. Logs:" >&2
-        cat "${KUBECONFIG_DIR}/kuery.log" >&2
+        tail -20 "${KUBECONFIG_DIR}/kuery.log" >&2
         exit 1
+    fi
+    # Verify we get the kuery.io API group back (not some other server on this port).
+    if curl -sk "https://localhost:${KUERY_PORT}/apis/kuery.io/v1alpha1" 2>/dev/null | grep -q "kuery.io"; then
+        READY=true
+        break
     fi
     sleep 1
 done
+if [[ "${READY}" != "true" ]]; then
+    echo "Error: kuery server did not become ready. Logs:" >&2
+    tail -20 "${KUBECONFIG_DIR}/kuery.log" >&2
+    exit 1
+fi
 
 # Give the sync controller time to discover and sync objects.
 log "Waiting for object sync (15s)..."
