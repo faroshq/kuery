@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/faroshq/kuery/internal/store"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/klog/v2"
 )
 
 // Engine orchestrates query execution: validate → generate SQL → execute → assemble response.
@@ -48,6 +50,14 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 	if err != nil {
 		metrics.QueryErrors.WithLabelValues("generation").Inc()
 		return nil, fmt.Errorf("sql generation: %w", err)
+	}
+
+	// Debug: log the generated SQL (use fmt for full output, klog truncates long strings).
+	if klog.V(2).Enabled() {
+		fmt.Fprintf(os.Stderr, "[SQL] hasRelations=%v args=%v\n%s\n\n", gen.HasRelations, gen.Args, gen.SQL)
+		if gen.CountSQL != "" {
+			fmt.Fprintf(os.Stderr, "[SQL-COUNT] args=%v\n%s\n\n", gen.CountArgs, gen.CountSQL)
+		}
 	}
 
 	// 4. Execute query.
