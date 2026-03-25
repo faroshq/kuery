@@ -627,6 +627,70 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 		}
 	}
 
+	// Label expressions (In, NotIn, Exists, DoesNotExist).
+	for _, expr := range f.LabelExpressions {
+		switch expr.Operator {
+		case v1alpha1.LabelOpIn:
+			if len(expr.Values) > 0 {
+				placeholders := make([]string, len(expr.Values))
+				for i := range expr.Values {
+					placeholders[i] = "?"
+					args = append(args, expr.Values[i])
+				}
+				switch g.dialect {
+				case "postgres":
+					clauses = append(clauses, fmt.Sprintf("%s.labels->>'%s' IN (%s)", alias, expr.Key, strings.Join(placeholders, ", ")))
+				default:
+					clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') IN (%s)", alias, expr.Key, strings.Join(placeholders, ", ")))
+				}
+			}
+		case v1alpha1.LabelOpNotIn:
+			if len(expr.Values) > 0 {
+				placeholders := make([]string, len(expr.Values))
+				for i := range expr.Values {
+					placeholders[i] = "?"
+					args = append(args, expr.Values[i])
+				}
+				switch g.dialect {
+				case "postgres":
+					clauses = append(clauses, fmt.Sprintf("(%s.labels->>'%s' IS NULL OR %s.labels->>'%s' NOT IN (%s))", alias, expr.Key, alias, expr.Key, strings.Join(placeholders, ", ")))
+				default:
+					clauses = append(clauses, fmt.Sprintf("(json_extract(%s.labels, '$.%s') IS NULL OR json_extract(%s.labels, '$.%s') NOT IN (%s))", alias, expr.Key, alias, expr.Key, strings.Join(placeholders, ", ")))
+				}
+			}
+		case v1alpha1.LabelOpExists:
+			switch g.dialect {
+			case "postgres":
+				clauses = append(clauses, fmt.Sprintf("%s.labels ? '%s'", alias, expr.Key))
+			default:
+				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') IS NOT NULL", alias, expr.Key))
+			}
+		case v1alpha1.LabelOpDoesNotExist:
+			switch g.dialect {
+			case "postgres":
+				clauses = append(clauses, fmt.Sprintf("NOT (%s.labels ? '%s')", alias, expr.Key))
+			default:
+				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') IS NULL", alias, expr.Key))
+			}
+		}
+	}
+
+	// JSONPath boolean filter (last resort).
+	if f.JSONPath != "" {
+		switch g.dialect {
+		case "postgres":
+			clauses = append(clauses, fmt.Sprintf("jsonb_path_match(%s.object, ?::jsonpath)", alias))
+			args = append(args, f.JSONPath)
+		default: // sqlite
+			// SQLite doesn't have jsonb_path_match. Use json_extract for simple paths.
+			// The JSONPath should be a simple extraction path like "$.status.phase"
+			// followed by a comparison. For boolean matching, we check if the
+			// extracted value is truthy.
+			clauses = append(clauses, fmt.Sprintf("json_extract(%s.object, ?) IS NOT NULL AND json_extract(%s.object, ?) != 'false' AND json_extract(%s.object, ?) != 0", alias, alias, alias))
+			args = append(args, f.JSONPath, f.JSONPath, f.JSONPath)
+		}
+	}
+
 	return clauses, args, needsRT
 }
 

@@ -701,3 +701,135 @@ func TestEngine_EmptyResult(t *testing.T) {
 		t.Fatal("expected incomplete=false for empty result")
 	}
 }
+
+// --- Label Expression Tests ---
+
+func TestEngine_LabelExpression_In(t *testing.T) {
+	s := setupTestStore(t)
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", map[string]string{"env": "prod"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "redis", map[string]string{"env": "staging"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "postgres", map[string]string{"env": "dev"}, ts("2025-06-01T00:00:00Z")),
+	)
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{LabelExpressions: []v1alpha1.LabelExpression{
+					{Key: "env", Operator: v1alpha1.LabelOpIn, Values: []string{"prod", "staging"}},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 2 {
+		t.Fatalf("expected 2 objects with env In [prod, staging], got %d", len(status.Objects))
+	}
+}
+
+func TestEngine_LabelExpression_NotIn(t *testing.T) {
+	s := setupTestStore(t)
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", map[string]string{"env": "prod"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "redis", map[string]string{"env": "staging"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "postgres", map[string]string{"env": "dev"}, ts("2025-06-01T00:00:00Z")),
+	)
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{LabelExpressions: []v1alpha1.LabelExpression{
+					{Key: "env", Operator: v1alpha1.LabelOpNotIn, Values: []string{"prod"}},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 2 {
+		t.Fatalf("expected 2 objects with env NotIn [prod], got %d", len(status.Objects))
+	}
+}
+
+func TestEngine_LabelExpression_Exists(t *testing.T) {
+	s := setupTestStore(t)
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", map[string]string{"env": "prod"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "redis", map[string]string{"app": "redis"}, ts("2025-06-01T00:00:00Z")),
+	)
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{LabelExpressions: []v1alpha1.LabelExpression{
+					{Key: "env", Operator: v1alpha1.LabelOpExists},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 1 {
+		t.Fatalf("expected 1 object with env Exists, got %d", len(status.Objects))
+	}
+}
+
+func TestEngine_LabelExpression_DoesNotExist(t *testing.T) {
+	s := setupTestStore(t)
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", map[string]string{"env": "prod"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "redis", map[string]string{"app": "redis"}, ts("2025-06-01T00:00:00Z")),
+	)
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{LabelExpressions: []v1alpha1.LabelExpression{
+					{Key: "env", Operator: v1alpha1.LabelOpDoesNotExist},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 1 {
+		t.Fatalf("expected 1 object with env DoesNotExist, got %d", len(status.Objects))
+	}
+}
+
+// --- JSONPath Filter Tests ---
+
+func TestEngine_JSONPathFilter(t *testing.T) {
+	s := setupTestStore(t)
+	// nginx has spec.replicas (truthy), redis has no replicas field.
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", nil, ts("2025-06-01T00:00:00Z")),
+	)
+	// Create a pod without spec.replicas.
+	seedObjects(t, s, makePod("cluster-a", "default", "redis-pod", nil))
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{JSONPath: "$.spec.replicas"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only nginx has spec.replicas.
+	if len(status.Objects) != 1 {
+		t.Fatalf("expected 1 object with spec.replicas, got %d", len(status.Objects))
+	}
+}

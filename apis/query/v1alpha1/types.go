@@ -92,9 +92,14 @@ type ObjectFilter struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
-	// Labels filters by label selector (matchLabels style).
+	// Labels filters by label selector (matchLabels style, simple key=value AND).
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
+
+	// LabelExpressions filters by label expressions (In, NotIn, Exists, DoesNotExist).
+	// Expressions are AND-ed with each other and with Labels.
+	// +optional
+	LabelExpressions []LabelExpression `json:"labelExpressions,omitempty"`
 
 	// Conditions filters by status conditions.
 	// +optional
@@ -126,6 +131,31 @@ type GroupKindFilter struct {
 	// Kind is the resource kind. Also resolves resource names and short names.
 	Kind string `json:"kind"`
 }
+
+// LabelExpression is a single label selector expression.
+type LabelExpression struct {
+	// Key is the label key.
+	Key string `json:"key"`
+
+	// Operator is the comparison operator.
+	// Supported: In, NotIn, Exists, DoesNotExist.
+	Operator LabelOperator `json:"operator"`
+
+	// Values is the set of values for In/NotIn operators.
+	// +optional
+	Values []string `json:"values,omitempty"`
+}
+
+// LabelOperator is the set of operators for label expressions.
+// +enum
+type LabelOperator string
+
+const (
+	LabelOpIn           LabelOperator = "In"
+	LabelOpNotIn        LabelOperator = "NotIn"
+	LabelOpExists       LabelOperator = "Exists"
+	LabelOpDoesNotExist LabelOperator = "DoesNotExist"
+)
 
 // ConditionFilter matches status conditions on objects.
 type ConditionFilter struct {

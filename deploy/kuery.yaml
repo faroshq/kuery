@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kuery-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kuery
+  namespace: kuery-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kuery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: kuery
+    namespace: kuery-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kuery
+  namespace: kuery-system
+  labels:
+    app: kuery
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kuery
+  template:
+    metadata:
+      labels:
+        app: kuery
+    spec:
+      serviceAccountName: kuery
+      containers:
+        - name: kuery
+          image: ghcr.io/faroshq/kuery:latest
+          args:
+            - --driver=sqlite
+            - --dsn=/data/kuery.db
+            - --secure-port=6443
+          ports:
+            - containerPort: 6443
+              name: https
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kuery
+  namespace: kuery-system
+spec:
+  selector:
+    app: kuery
+  ports:
+    - port: 443
+      targetPort: 6443
+      protocol: TCP
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.kuery.io
+spec:
+  service:
+    name: kuery
+    namespace: kuery-system
+  group: kuery.io
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  insecureSkipTLSVerify: true
