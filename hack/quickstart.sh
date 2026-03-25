@@ -273,8 +273,18 @@ run_query() {
     info "Request body:"
     echo "${body}" | jq .
     echo ""
-    info "Response (.status):"
-    ${CURL} -d "${body}" | jq '.status'
+    local RESP
+    RESP=$(${CURL} -d "${body}")
+    # Check if it's an error response (kind: Status) vs success (kind: Query).
+    local resp_kind
+    resp_kind=$(echo "${RESP}" | jq -r '.kind // empty')
+    if [[ "${resp_kind}" == "Status" ]]; then
+        info "Error:"
+        echo "${RESP}" | jq '{status: .status, message: .message, reason: .reason}'
+    else
+        info "Response (.status):"
+        echo "${RESP}" | jq '.status'
+    fi
 }
 
 # ============================================================================

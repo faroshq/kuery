@@ -278,12 +278,7 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 		if len(node.relationSpec.Filters) > 0 {
 			for _, f := range node.relationSpec.Filters {
 				rtAlias := fmt.Sprintf("rt%d", levelCounter)
-				andClauses, filterArgs, needsRT := g.buildObjectFilterWithRT(f, childAlias, rtAlias)
-				if needsRT {
-					joinClause += fmt.Sprintf(
-						" JOIN resource_types %s ON %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind",
-						rtAlias, rtAlias, childAlias, rtAlias, childAlias, rtAlias, childAlias)
-				}
+				andClauses, filterArgs, _ := g.buildObjectFilterWithRT(f, childAlias, rtAlias)
 				relFilterWhere = append(relFilterWhere, andClauses...)
 				relFilterArgs = append(relFilterArgs, filterArgs...)
 			}
@@ -453,14 +448,10 @@ func (g *Generator) buildRootClauses(spec *v1alpha1.QuerySpec, alias string) ([]
 	}
 
 	// Object filters.
-	needsRT := false
 	if spec.Filter != nil && len(spec.Filter.Objects) > 0 {
 		var orGroups []string
 		for _, f := range spec.Filter.Objects {
-			andClauses, filterArgs, rtNeeded := g.buildObjectFilter(f, alias)
-			if rtNeeded {
-				needsRT = true
-			}
+			andClauses, filterArgs, _ := g.buildObjectFilter(f, alias)
 			if len(andClauses) > 0 {
 				orGroups = append(orGroups, "("+strings.Join(andClauses, " AND ")+")")
 				args = append(args, filterArgs...)
@@ -469,12 +460,6 @@ func (g *Generator) buildRootClauses(spec *v1alpha1.QuerySpec, alias string) ([]
 		if len(orGroups) > 0 {
 			whereClauses = append(whereClauses, "("+strings.Join(orGroups, " OR ")+")")
 		}
-	}
-
-	if needsRT {
-		joins = append(joins, fmt.Sprintf(
-			"JOIN resource_types rt ON rt.cluster = %s.cluster AND rt.api_group = %s.api_group AND rt.kind = %s.kind",
-			alias, alias, alias))
 	}
 
 	return whereClauses, args, joins, nil
@@ -522,7 +507,8 @@ func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (cl
 // buildObjectFilterWithRT converts a single ObjectFilter using a custom RT alias.
 func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAlias string) (clauses []string, args []any, needsRT bool) {
 	if f.GroupKind != nil {
-		needsRT = true
+		// Use EXISTS subquery instead of JOIN to avoid row duplication when
+		// multiple resource_type versions exist for the same (cluster, api_group, kind).
 		if f.GroupKind.APIGroup != "" {
 			clauses = append(clauses, alias+".api_group = ?")
 			args = append(args, f.GroupKind.APIGroup)
@@ -531,11 +517,15 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 			switch g.dialect {
 			case "postgres":
 				clauses = append(clauses, fmt.Sprintf(
-					"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR ? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.short_names))))",
+					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND "+
+						"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR ? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.short_names)))))",
+					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias,
 					rtAlias, rtAlias, rtAlias, rtAlias))
 			default:
 				clauses = append(clauses, fmt.Sprintf(
-					"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR EXISTS (SELECT 1 FROM json_each(%s.short_names) WHERE json_each.value = lower(?)))",
+					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND "+
+						"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR EXISTS (SELECT 1 FROM json_each(%s.short_names) WHERE json_each.value = lower(?))))",
+					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias,
 					rtAlias, rtAlias, rtAlias, rtAlias))
 			}
 			args = append(args, f.GroupKind.Kind, f.GroupKind.Kind, f.GroupKind.Kind, strings.ToLower(f.GroupKind.Kind))
@@ -615,13 +605,16 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 	}
 
 	if len(f.Categories) > 0 {
-		needsRT = true
 		for _, cat := range f.Categories {
 			switch g.dialect {
 			case "postgres":
-				clauses = append(clauses, fmt.Sprintf("? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.categories)))", rtAlias))
+				clauses = append(clauses, fmt.Sprintf(
+					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND ? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.categories))))",
+					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias, rtAlias))
 			default:
-				clauses = append(clauses, fmt.Sprintf("EXISTS (SELECT 1 FROM json_each(%s.categories) WHERE json_each.value = ?)", rtAlias))
+				clauses = append(clauses, fmt.Sprintf(
+					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND EXISTS (SELECT 1 FROM json_each(%s.categories) WHERE json_each.value = ?))",
+					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias, rtAlias))
 			}
 			args = append(args, cat)
 		}
