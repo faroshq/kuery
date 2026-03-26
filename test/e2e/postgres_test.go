@@ -14,7 +14,9 @@ import (
 	"github.com/faroshq/kuery/internal/store"
 
 	"github.com/google/uuid"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 	"gorm.io/datatypes"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
@@ -28,6 +30,10 @@ func setupPostgresStore(t *testing.T) store.Store {
 		postgres.WithDatabase("kuery_test"),
 		postgres.WithUsername("kuery"),
 		postgres.WithPassword("kuery"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(30*time.Second)),
 	)
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
@@ -39,12 +45,18 @@ func setupPostgresStore(t *testing.T) store.Store {
 		t.Fatalf("get connection string: %v", err)
 	}
 
-	s, err := store.NewStore(store.Config{
-		Driver: "postgres",
-		DSN:    connStr,
+	// Retry connection — container port mapping may take a moment.
+	var s store.Store
+	err = waitForCondition(15*time.Second, time.Second, func() bool {
+		var storeErr error
+		s, storeErr = store.NewStore(store.Config{
+			Driver: "postgres",
+			DSN:    connStr,
+		})
+		return storeErr == nil
 	})
 	if err != nil {
-		t.Fatalf("create postgres store: %v", err)
+		t.Fatalf("create postgres store (after retries): %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 
