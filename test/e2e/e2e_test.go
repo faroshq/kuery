@@ -3,7 +3,7 @@
 package e2e_test
 
 import (
-	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/testcontainers/testcontainers-go/modules/k3s"
 )
 
 var (
@@ -25,15 +27,11 @@ var (
 	kueryCmd   *exec.Cmd
 )
 
-const (
-	clusterA = "kuery-e2e-alpha"
-	clusterB = "kuery-e2e-beta"
-)
-
 func TestMain(m *testing.M) {
 	var code int
 	defer func() { os.Exit(code) }()
 
+	ctx := context.Background()
 	httpClient = newInsecureClient()
 
 	var err error
@@ -43,43 +41,56 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// 1. Create kind clusters.
-	log.Println("Creating kind clusters...")
-	if err := createKindCluster(clusterA); err != nil {
-		log.Fatalf("create cluster %s: %v", clusterA, err)
+	// 1. Start K3s clusters via testcontainers.
+	log.Println("Starting K3s cluster A...")
+	containerA, err := k3s.Run(ctx, "rancher/k3s:v1.31.6-k3s1")
+	if err != nil {
+		log.Fatalf("start K3s cluster-a: %v", err)
 	}
-	defer deleteKindCluster(clusterA)
+	defer containerA.Terminate(ctx)
 
-	if err := createKindCluster(clusterB); err != nil {
-		log.Fatalf("create cluster %s: %v", clusterB, err)
+	log.Println("Starting K3s cluster B...")
+	containerB, err := k3s.Run(ctx, "rancher/k3s:v1.31.6-k3s1")
+	if err != nil {
+		log.Fatalf("start K3s cluster-b: %v", err)
 	}
-	defer deleteKindCluster(clusterB)
+	defer containerB.Terminate(ctx)
 
-	// 2. Export kubeconfigs.
+	// 2. Get kubeconfigs and write to files.
 	kcA := filepath.Join(tmpDir, "alpha.kubeconfig")
 	kcB := filepath.Join(tmpDir, "beta.kubeconfig")
-	if err := exportKubeconfig(clusterA, kcA); err != nil {
-		log.Fatalf("export kubeconfig %s: %v", clusterA, err)
+
+	kubeConfigA, err := containerA.GetKubeConfig(ctx)
+	if err != nil {
+		log.Fatalf("get kubeconfig cluster-a: %v", err)
 	}
-	if err := exportKubeconfig(clusterB, kcB); err != nil {
-		log.Fatalf("export kubeconfig %s: %v", clusterB, err)
+	if err := os.WriteFile(kcA, kubeConfigA, 0600); err != nil {
+		log.Fatalf("write kubeconfig cluster-a: %v", err)
 	}
 
-	// 3. Apply fixtures.
+	kubeConfigB, err := containerB.GetKubeConfig(ctx)
+	if err != nil {
+		log.Fatalf("get kubeconfig cluster-b: %v", err)
+	}
+	if err := os.WriteFile(kcB, kubeConfigB, 0600); err != nil {
+		log.Fatalf("write kubeconfig cluster-b: %v", err)
+	}
+
+	// 3. Apply fixtures via client-go.
 	log.Println("Applying fixtures...")
-	if err := applyFixtures(kcA, clusterAFixtures); err != nil {
+	if err := applyYAMLFromKubeconfig(ctx, kubeConfigA, "demo", clusterAFixtures); err != nil {
 		log.Fatalf("apply fixtures cluster-a: %v", err)
 	}
-	if err := applyFixtures(kcB, clusterBFixtures); err != nil {
+	if err := applyYAMLFromKubeconfig(ctx, kubeConfigB, "demo", clusterBFixtures); err != nil {
 		log.Fatalf("apply fixtures cluster-b: %v", err)
 	}
 
-	// 4. Wait for rollouts.
+	// 4. Wait for rollouts via client-go.
 	log.Println("Waiting for rollouts...")
-	if err := waitForRollout(kcA, "demo", "nginx"); err != nil {
+	if err := waitForDeploymentReady(ctx, kubeConfigA, "demo", "nginx", 120*time.Second); err != nil {
 		log.Fatalf("rollout nginx: %v", err)
 	}
-	if err := waitForRollout(kcB, "demo", "redis"); err != nil {
+	if err := waitForDeploymentReady(ctx, kubeConfigB, "demo", "redis", 120*time.Second); err != nil {
 		log.Fatalf("rollout redis: %v", err)
 	}
 
@@ -144,7 +155,7 @@ func TestMain(m *testing.M) {
 		log.Fatalf("kuery API not ready: %v", err)
 	}
 
-	// 9. Wait for data sync (poll for Deployments from both clusters).
+	// 9. Wait for data sync.
 	log.Println("Waiting for data sync...")
 	syncClient := &http.Client{
 		Timeout:   10 * time.Second,
@@ -158,7 +169,6 @@ func TestMain(m *testing.M) {
 		}
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
-		// Check that count >= 2 (nginx from cluster-a + redis from cluster-b).
 		return strings.Contains(string(respBody), `"count":`) &&
 			!strings.Contains(string(respBody), `"count":0`) &&
 			!strings.Contains(string(respBody), `"count":1`)
@@ -172,46 +182,6 @@ func TestMain(m *testing.M) {
 	code = m.Run()
 }
 
-func createKindCluster(name string) error {
-	cmd := exec.Command("kind", "create", "cluster", "--name", name, "--wait", "60s")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func deleteKindCluster(name string) {
-	exec.Command("kind", "delete", "cluster", "--name", name).Run()
-}
-
-func exportKubeconfig(clusterName, path string) error {
-	cmd := exec.Command("kind", "get", "kubeconfig", "--name", clusterName)
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("kind get kubeconfig: %w", err)
-	}
-	return os.WriteFile(path, out, 0600)
-}
-
-func applyFixtures(kubeconfig, yaml string) error {
-	// Create namespace first.
-	nsCmd := exec.Command("kubectl", "--kubeconfig="+kubeconfig, "create", "namespace", "demo")
-	nsCmd.Run() // Ignore error if already exists.
-
-	cmd := exec.Command("kubectl", "--kubeconfig="+kubeconfig, "-n", "demo", "apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(yaml)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func waitForRollout(kubeconfig, namespace, deployment string) error {
-	cmd := exec.Command("kubectl", "--kubeconfig="+kubeconfig, "-n", namespace,
-		"rollout", "status", "deployment/"+deployment, "--timeout=120s")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
 func getFreePort() (int, error) {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -223,7 +193,6 @@ func getFreePort() (int, error) {
 }
 
 func findRepoRoot() string {
-	// Walk up from the test file to find go.mod.
 	dir, _ := os.Getwd()
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
@@ -231,7 +200,7 @@ func findRepoRoot() string {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "." // Fallback.
+			return "."
 		}
 		dir = parent
 	}
@@ -242,7 +211,6 @@ func dumpLog(tmpDir string) {
 	if err != nil {
 		return
 	}
-	// Print last 50 lines.
 	lines := strings.Split(string(data), "\n")
 	start := 0
 	if len(lines) > 50 {
@@ -253,16 +221,3 @@ func dumpLog(tmpDir string) {
 		log.Println(line)
 	}
 }
-
-func init() {
-	// Ensure httpClient is non-nil even if TestMain hasn't run yet (for compilation).
-	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		}
-	}
-}
-
-// Ensure tmpDir has a bytes import for fixtures application
-var _ = bytes.NewReader
