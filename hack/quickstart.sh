@@ -22,9 +22,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-log()  { echo -e "${GREEN}==>${NC} $*"; }
-info() { echo -e "${CYAN}    $*${NC}"; }
-bold() { echo -e "${BOLD}$*${NC}"; }
+log()  { printf "${GREEN}==> %s${NC}\n" "$*"; }
+info() { printf "${CYAN}    %s${NC}\n" "$*"; }
+bold() { printf "${BOLD}%s${NC}\n" "$*"; }
 
 cleanup() {
     log "Cleaning up..."
