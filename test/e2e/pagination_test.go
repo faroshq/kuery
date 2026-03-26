@@ -34,26 +34,32 @@ func TestPagination_Offset(t *testing.T) {
 	page1 := queryKuery(t, v1alpha1.QuerySpec{
 		Filter:  &v1alpha1.QueryFilter{Objects: []v1alpha1.ObjectFilter{{Namespace: "demo"}}},
 		Limit:   2,
-		Objects: &v1alpha1.ObjectsSpec{Object: proj},
+		Objects: &v1alpha1.ObjectsSpec{Cluster: true, Object: proj},
 	})
 	// Page 2 with offset.
 	page2 := queryKuery(t, v1alpha1.QuerySpec{
 		Filter:  &v1alpha1.QueryFilter{Objects: []v1alpha1.ObjectFilter{{Namespace: "demo"}}},
 		Limit:   2,
 		Page:    &v1alpha1.PageSpec{First: 2},
-		Objects: &v1alpha1.ObjectsSpec{Object: proj},
+		Objects: &v1alpha1.ObjectsSpec{Cluster: true, Object: proj},
 	})
 
 	if len(page1.Objects) == 0 || len(page2.Objects) == 0 {
 		t.Fatal("expected results on both pages")
 	}
 
-	// Pages should have different objects.
-	names1 := objectNames(t, page1.Objects)
-	names2 := objectNames(t, page2.Objects)
-	for _, n := range names1 {
-		if containsString(names2, n) {
-			t.Fatalf("page 1 and page 2 should not overlap, found %q in both", n)
+	// Pages should have different objects (compare cluster+name to handle duplicates across clusters).
+	type objKey struct{ cluster, name string }
+	keys1 := make(map[objKey]bool)
+	for _, o := range page1.Objects {
+		name := getProjectedString(t, o.Object, "metadata", "name")
+		keys1[objKey{o.Cluster, name}] = true
+	}
+	for _, o := range page2.Objects {
+		name := getProjectedString(t, o.Object, "metadata", "name")
+		k := objKey{o.Cluster, name}
+		if keys1[k] {
+			t.Fatalf("page 1 and page 2 should not overlap, found %v in both", k)
 		}
 	}
 }

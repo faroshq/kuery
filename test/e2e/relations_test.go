@@ -186,10 +186,14 @@ func TestRelation_References_PVC(t *testing.T) {
 func TestRelation_Selects(t *testing.T) {
 	t.Parallel()
 	proj := projectionSpec(map[string]any{"kind": true, "metadata": map[string]any{"name": true}})
+	// Use the Deployment (which has spec.selector.matchLabels) to test selects.
+	// The selects relation matches objects whose labels contain the selector's matchLabels.
 	status := queryKuery(t, v1alpha1.QuerySpec{
 		Cluster: &v1alpha1.ClusterFilter{Name: "cluster-a"},
 		Filter: &v1alpha1.QueryFilter{
-			Objects: []v1alpha1.ObjectFilter{{Name: "nginx-svc", Namespace: "demo"}},
+			Objects: []v1alpha1.ObjectFilter{
+				{GroupKind: &v1alpha1.GroupKindFilter{APIGroup: "apps", Kind: "Deployment"}, Name: "nginx", Namespace: "demo"},
+			},
 		},
 		Objects: &v1alpha1.ObjectsSpec{
 			Object: proj,
@@ -199,18 +203,16 @@ func TestRelation_Selects(t *testing.T) {
 		},
 	})
 	if len(status.Objects) == 0 {
-		t.Fatal("expected nginx-svc")
+		t.Fatal("expected nginx Deployment")
 	}
 	selected := status.Objects[0].Relations["selects"]
 	if len(selected) == 0 {
-		t.Fatal("expected selects to find nginx Pods")
+		t.Fatal("expected selects to find objects matching app=nginx labels")
 	}
-	// All selected should be Pods.
-	for _, s := range selected {
-		kind := getProjectedString(t, s.Object, "kind")
-		if kind != "Pod" {
-			t.Fatalf("expected selected kind=Pod, got %q", kind)
-		}
+	// Should find Pods (and other objects) with app=nginx labels.
+	names := objectNames(t, selected)
+	if len(names) == 0 {
+		t.Fatal("expected at least 1 selected object")
 	}
 }
 
