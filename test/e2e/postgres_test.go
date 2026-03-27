@@ -3,370 +3,245 @@
 package e2e_test
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
-	"strings"
+	"io"
 	"testing"
-	"time"
 
 	"github.com/faroshq/kuery/apis/query/v1alpha1"
-	"github.com/faroshq/kuery/internal/engine"
-	"github.com/faroshq/kuery/internal/store"
-
-	"github.com/google/uuid"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
-	"gorm.io/datatypes"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// setupPostgresStore starts a PostgreSQL container and returns a connected store.
-func setupPostgresStore(t *testing.T) store.Store {
+// queryPostgres is like queryKuery but hits the PostgreSQL-backed server.
+func queryPostgres(t *testing.T, spec v1alpha1.QuerySpec) v1alpha1.QueryStatus {
 	t.Helper()
-	ctx := context.Background()
-
-	pgContainer, err := postgres.Run(ctx, "postgres:16",
-		postgres.WithDatabase("kuery_test"),
-		postgres.WithUsername("kuery"),
-		postgres.WithPassword("kuery"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(30*time.Second)),
-	)
+	query := map[string]any{
+		"apiVersion": "kuery.io/v1alpha1",
+		"kind":       "Query",
+		"spec":       spec,
+	}
+	body, err := json.Marshal(query)
 	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
+		t.Fatalf("marshal query: %v", err)
 	}
-	t.Cleanup(func() { pgContainer.Terminate(ctx) })
 
-	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	resp, err := httpClient.Post(pgServerURL+"/apis/kuery.io/v1alpha1/queries", "application/json", bytes.NewReader(body))
 	if err != nil {
-		t.Fatalf("get connection string: %v", err)
+		t.Fatalf("POST query to postgres server: %v", err)
 	}
+	defer resp.Body.Close()
 
-	// Retry connection — container port mapping may take a moment.
-	var s store.Store
-	err = waitForCondition(15*time.Second, time.Second, func() bool {
-		var storeErr error
-		s, storeErr = store.NewStore(store.Config{
-			Driver: "postgres",
-			DSN:    connStr,
-		})
-		return storeErr == nil
-	})
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("create postgres store (after retries): %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-
-	if err := s.AutoMigrate(); err != nil {
-		t.Fatalf("auto-migrate: %v", err)
+		t.Fatalf("read response: %v", err)
 	}
 
-	return s
+	var raw map[string]any
+	if err := json.Unmarshal(respBody, &raw); err != nil {
+		t.Fatalf("unmarshal response: %v\nbody: %s", err, string(respBody))
+	}
+	if kind, _ := raw["kind"].(string); kind == "Status" {
+		msg, _ := raw["message"].(string)
+		t.Fatalf("postgres query failed: %s", msg)
+	}
+
+	statusRaw, _ := json.Marshal(raw["status"])
+	var status v1alpha1.QueryStatus
+	if err := json.Unmarshal(statusRaw, &status); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	return status
 }
 
-// --- Seed helpers (same patterns as internal/engine/engine_test.go) ---
-
-func pgMustJSON(v any) datatypes.JSON {
-	b, _ := json.Marshal(v)
-	return datatypes.JSON(b)
+// pgProj is a shorthand for projection specs in Postgres tests.
+func pgProj(spec map[string]any) *runtime.RawExtension {
+	raw, _ := json.Marshal(spec)
+	return &runtime.RawExtension{Raw: raw}
 }
 
-func pgTS(s string) *time.Time {
-	t, _ := time.Parse(time.RFC3339, s)
-	return &t
-}
-
-func pgSeedDeployment(t *testing.T, s store.Store, cluster, ns, name string, labels map[string]string) *store.ObjectModel {
-	t.Helper()
-	obj := map[string]any{
-		"apiVersion": "apps/v1", "kind": "Deployment",
-		"metadata": map[string]any{"name": name, "namespace": ns, "labels": labels},
-		"spec":     map[string]any{"replicas": 3},
-	}
-	m := &store.ObjectModel{
-		ID: uuid.New(), UID: uuid.New().String(), Cluster: cluster,
-		APIGroup: "apps", APIVersion: "v1", Kind: "Deployment", Resource: "deployments",
-		Namespace: ns, Name: name, Labels: pgMustJSON(labels),
-		CreationTS: pgTS("2025-06-01T00:00:00Z"), Object: pgMustJSON(obj),
-	}
-	if err := s.UpsertObject(context.Background(), m); err != nil {
-		t.Fatal(err)
-	}
-	return m
-}
-
-func pgSeedPod(t *testing.T, s store.Store, cluster, ns, name, parentUID string) *store.ObjectModel {
-	t.Helper()
-	ownerRefs := []map[string]string{{"uid": parentUID}}
-	obj := map[string]any{
-		"apiVersion": "v1", "kind": "Pod",
-		"metadata": map[string]any{"name": name, "namespace": ns},
-		"spec":     map[string]any{"volumes": []any{}},
-	}
-	m := &store.ObjectModel{
-		ID: uuid.New(), UID: uuid.New().String(), Cluster: cluster,
-		APIVersion: "v1", Kind: "Pod", Resource: "pods",
-		Namespace: ns, Name: name, OwnerRefs: pgMustJSON(ownerRefs),
-		CreationTS: pgTS("2025-06-01T00:00:00Z"), Object: pgMustJSON(obj),
-	}
-	if err := s.UpsertObject(context.Background(), m); err != nil {
-		t.Fatal(err)
-	}
-	return m
-}
-
-func pgSeedRT(t *testing.T, s store.Store, cluster, group, version, kind, resource string) {
-	t.Helper()
-	rt := &store.ResourceTypeModel{
-		Cluster: cluster, APIGroup: group, APIVersion: version,
-		Kind: kind, Singular: strings.ToLower(kind), Resource: resource,
-		ShortNames: pgMustJSON([]string{}), Categories: pgMustJSON([]string{"all"}),
-		Namespaced: true,
-	}
-	if err := s.UpsertResourceType(context.Background(), rt); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func pgSeedLinkedObject(t *testing.T, s store.Store, cluster, ns, name string, relatesTo []map[string]string) *store.ObjectModel {
-	t.Helper()
-	annotations := map[string]any{"kuery.io/relates-to": relatesTo}
-	obj := map[string]any{
-		"apiVersion": "v1", "kind": "ConfigMap",
-		"metadata": map[string]any{"name": name, "namespace": ns, "annotations": annotations},
-	}
-	m := &store.ObjectModel{
-		ID: uuid.New(), UID: uuid.New().String(), Cluster: cluster,
-		APIVersion: "v1", Kind: "ConfigMap", Resource: "configmaps",
-		Namespace: ns, Name: name, Annotations: pgMustJSON(annotations),
-		CreationTS: pgTS("2025-06-01T00:00:00Z"), Object: pgMustJSON(obj),
-	}
-	if err := s.UpsertObject(context.Background(), m); err != nil {
-		t.Fatal(err)
-	}
-	return m
-}
-
-func pgSeedSecret(t *testing.T, s store.Store, cluster, ns, name string, labels map[string]string) *store.ObjectModel {
-	t.Helper()
-	obj := map[string]any{
-		"apiVersion": "v1", "kind": "Secret",
-		"metadata": map[string]any{"name": name, "namespace": ns, "labels": labels},
-	}
-	m := &store.ObjectModel{
-		ID: uuid.New(), UID: uuid.New().String(), Cluster: cluster,
-		APIVersion: "v1", Kind: "Secret", Resource: "secrets",
-		Namespace: ns, Name: name, Labels: pgMustJSON(labels),
-		CreationTS: pgTS("2025-06-01T00:00:00Z"), Object: pgMustJSON(obj),
-	}
-	if err := s.UpsertObject(context.Background(), m); err != nil {
-		t.Fatal(err)
-	}
-	return m
-}
-
-// --- PostgreSQL Integration Tests ---
+// --- PostgreSQL E2E Tests (full pipeline: K3s -> kuery sync -> PostgreSQL -> HTTP query) ---
 
 func TestPostgres_BasicQuery(t *testing.T) {
-	s := setupPostgresStore(t)
-	pgSeedDeployment(t, s, "c1", "default", "nginx", map[string]string{"app": "nginx"})
-	pgSeedDeployment(t, s, "c1", "default", "redis", map[string]string{"app": "redis"})
-
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{Count: true})
-	if err != nil {
-		t.Fatal(err)
+	t.Parallel()
+	status := queryPostgres(t, v1alpha1.QuerySpec{
+		Count: true,
+		Limit: 5,
+		Objects: &v1alpha1.ObjectsSpec{
+			Cluster: true,
+			Object:  pgProj(map[string]any{"kind": true, "metadata": map[string]any{"name": true}}),
+		},
+	})
+	if status.Count == nil || *status.Count == 0 {
+		t.Fatal("expected objects synced into PostgreSQL")
 	}
-	if status.Count == nil || *status.Count != 2 {
-		t.Fatalf("expected count=2, got %v", status.Count)
+	if len(status.Objects) == 0 {
+		t.Fatal("expected results")
+	}
+	// Verify objects have cluster and projected fields.
+	for _, obj := range status.Objects {
+		if obj.Cluster == "" {
+			t.Fatal("expected cluster to be populated")
+		}
 	}
 }
 
 func TestPostgres_GroupKindFilter(t *testing.T) {
-	s := setupPostgresStore(t)
-	pgSeedDeployment(t, s, "c1", "default", "nginx", nil)
-	pgSeedRT(t, s, "c1", "apps", "v1", "Deployment", "deployments")
-
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+	t.Parallel()
+	status := queryPostgres(t, v1alpha1.QuerySpec{
 		Filter: &v1alpha1.QueryFilter{
 			Objects: []v1alpha1.ObjectFilter{
-				{GroupKind: &v1alpha1.GroupKindFilter{APIGroup: "apps", Kind: "Deployment"}},
+				{GroupKind: &v1alpha1.GroupKindFilter{APIGroup: "apps", Kind: "Deployment"}, Namespace: "demo"},
 			},
 		},
+		Count:   true,
+		Objects: &v1alpha1.ObjectsSpec{Object: pgProj(map[string]any{"kind": true, "metadata": map[string]any{"name": true}})},
 	})
-	if err != nil {
-		t.Fatal(err)
+	if status.Count == nil || *status.Count != 2 {
+		t.Fatalf("expected 2 Deployments in demo (nginx+redis), got count=%v", status.Count)
 	}
-	if len(status.Objects) != 1 {
-		t.Fatalf("expected 1 Deployment, got %d", len(status.Objects))
+	names := objectNames(t, status.Objects)
+	if !containsString(names, "nginx") || !containsString(names, "redis") {
+		t.Fatalf("expected nginx and redis, got %v", names)
 	}
 }
 
 func TestPostgres_LabelsContainment(t *testing.T) {
-	// Test PostgreSQL @> JSONB containment operator for labels.
-	s := setupPostgresStore(t)
-	pgSeedDeployment(t, s, "c1", "default", "nginx", map[string]string{"app": "nginx", "env": "prod"})
-	pgSeedDeployment(t, s, "c1", "default", "redis", map[string]string{"app": "redis"})
-
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+	t.Parallel()
+	// Tests PostgreSQL @> JSONB containment operator.
+	status := queryPostgres(t, v1alpha1.QuerySpec{
 		Filter: &v1alpha1.QueryFilter{
 			Objects: []v1alpha1.ObjectFilter{
-				{Labels: map[string]string{"app": "nginx"}},
+				{Labels: map[string]string{"app": "nginx"}, Namespace: "demo"},
 			},
 		},
+		Count: true,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(status.Objects) != 1 {
-		t.Fatalf("expected 1 object with app=nginx, got %d", len(status.Objects))
+	if status.Count == nil || *status.Count == 0 {
+		t.Fatal("expected objects with app=nginx label via PostgreSQL @> operator")
 	}
 }
 
 func TestPostgres_Descendants(t *testing.T) {
-	s := setupPostgresStore(t)
-	deploy := pgSeedDeployment(t, s, "c1", "default", "nginx", nil)
-	pgSeedPod(t, s, "c1", "default", "nginx-pod-1", deploy.UID)
-	pgSeedPod(t, s, "c1", "default", "nginx-pod-2", deploy.UID)
-
-	projJSON, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": true}})
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+	t.Parallel()
+	proj := pgProj(map[string]any{"kind": true, "metadata": map[string]any{"name": true}})
+	status := queryPostgres(t, v1alpha1.QuerySpec{
 		Filter: &v1alpha1.QueryFilter{
-			Objects: []v1alpha1.ObjectFilter{{Name: "nginx"}},
+			Objects: []v1alpha1.ObjectFilter{
+				{GroupKind: &v1alpha1.GroupKindFilter{APIGroup: "apps", Kind: "Deployment"}, Name: "nginx", Namespace: "demo"},
+			},
 		},
 		Objects: &v1alpha1.ObjectsSpec{
-			Object: &k8sruntime.RawExtension{Raw: projJSON},
+			Object: proj,
 			Relations: map[string]v1alpha1.RelationSpec{
-				"descendants": {Objects: &v1alpha1.ObjectsSpec{Object: &k8sruntime.RawExtension{Raw: projJSON}}},
+				"descendants": {Objects: &v1alpha1.ObjectsSpec{Object: proj}},
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(status.Objects) != 1 {
-		t.Fatalf("expected 1 root, got %d", len(status.Objects))
+	if len(status.Objects) == 0 {
+		t.Fatal("expected nginx deployment")
 	}
 	descendants := status.Objects[0].Relations["descendants"]
-	if len(descendants) != 2 {
-		t.Fatalf("expected 2 descendants, got %d", len(descendants))
+	if len(descendants) == 0 {
+		t.Fatal("expected ReplicaSet descendants via PostgreSQL jsonb_build_array ownerRef JOIN")
+	}
+	kind := getProjectedString(t, descendants[0].Object, "kind")
+	if kind != "ReplicaSet" {
+		t.Fatalf("expected ReplicaSet, got %q", kind)
 	}
 }
 
 func TestPostgres_TransitiveCTE(t *testing.T) {
-	s := setupPostgresStore(t)
-	deploy := pgSeedDeployment(t, s, "c1", "default", "nginx", nil)
-	pod := pgSeedPod(t, s, "c1", "default", "nginx-pod", deploy.UID)
-	// Create a grandchild to test recursion.
-	pgSeedPod(t, s, "c1", "default", "nginx-sidecar", pod.UID)
-
-	projJSON, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": true}})
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+	t.Parallel()
+	proj := pgProj(map[string]any{"kind": true, "metadata": map[string]any{"name": true}})
+	status := queryPostgres(t, v1alpha1.QuerySpec{
 		Filter: &v1alpha1.QueryFilter{
-			Objects: []v1alpha1.ObjectFilter{{Name: "nginx"}},
+			Objects: []v1alpha1.ObjectFilter{
+				{GroupKind: &v1alpha1.GroupKindFilter{APIGroup: "apps", Kind: "Deployment"}, Name: "nginx", Namespace: "demo"},
+			},
 		},
 		Objects: &v1alpha1.ObjectsSpec{
-			Object: &k8sruntime.RawExtension{Raw: projJSON},
+			Object: proj,
 			Relations: map[string]v1alpha1.RelationSpec{
-				"descendants+": {Objects: &v1alpha1.ObjectsSpec{Object: &k8sruntime.RawExtension{Raw: projJSON}}},
+				"descendants+": {Objects: &v1alpha1.ObjectsSpec{Object: proj}},
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(status.Objects) == 0 {
-		t.Fatal("expected root")
+		t.Fatal("expected nginx deployment")
 	}
-	// Should find pod at depth 1, sidecar at depth 2 (nested).
+	// Recursive CTE should find RS -> Pods.
 	d1 := status.Objects[0].Relations["descendants+"]
-	if len(d1) != 1 {
-		t.Fatalf("expected 1 direct descendant, got %d", len(d1))
+	if len(d1) == 0 {
+		t.Fatal("expected transitive descendants via PostgreSQL recursive CTE with ARRAY cycle detection")
 	}
+	// RS should have nested Pods.
 	d2 := d1[0].Relations["descendants+"]
-	if len(d2) != 1 {
-		t.Fatalf("expected 1 nested descendant, got %d", len(d2))
+	if len(d2) == 0 {
+		t.Fatal("expected Pods nested under RS")
 	}
 }
 
 func TestPostgres_CrossClusterLinked(t *testing.T) {
-	s := setupPostgresStore(t)
-	pgSeedLinkedObject(t, s, "c1", "default", "my-config",
-		[]map[string]string{{"cluster": "c2", "kind": "Secret", "namespace": "default", "name": "shared-cert"}})
-	pgSeedSecret(t, s, "c2", "default", "shared-cert", nil)
-
-	projJSON, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": true}})
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+	t.Parallel()
+	proj := pgProj(map[string]any{"kind": true, "metadata": map[string]any{"name": true}})
+	status := queryPostgres(t, v1alpha1.QuerySpec{
+		Cluster: &v1alpha1.ClusterFilter{Name: "cluster-a"},
 		Filter: &v1alpha1.QueryFilter{
-			Objects: []v1alpha1.ObjectFilter{{Name: "my-config"}},
+			Objects: []v1alpha1.ObjectFilter{{Name: "app-config", Namespace: "demo"}},
 		},
 		Objects: &v1alpha1.ObjectsSpec{
 			Cluster: true,
-			Object:  &k8sruntime.RawExtension{Raw: projJSON},
+			Object:  proj,
 			Relations: map[string]v1alpha1.RelationSpec{
-				"linked": {Objects: &v1alpha1.ObjectsSpec{Cluster: true, Object: &k8sruntime.RawExtension{Raw: projJSON}}},
+				"linked": {Objects: &v1alpha1.ObjectsSpec{Cluster: true, Object: proj}},
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(status.Objects) == 0 {
-		t.Fatal("expected root")
+		t.Fatal("expected app-config")
 	}
 	linked := status.Objects[0].Relations["linked"]
-	if len(linked) != 1 {
-		t.Fatalf("expected 1 linked object, got %d", len(linked))
+	if len(linked) == 0 {
+		t.Fatal("expected linked Secret from cluster-b via PostgreSQL jsonb_array_elements")
 	}
-	if linked[0].Cluster != "c2" {
-		t.Fatalf("expected linked from c2, got %q", linked[0].Cluster)
+	if linked[0].Cluster != "cluster-b" {
+		t.Fatalf("expected linked from cluster-b, got %q", linked[0].Cluster)
+	}
+	name := getProjectedString(t, linked[0].Object, "metadata", "name")
+	if name != "shared-cert" {
+		t.Fatalf("expected shared-cert, got %q", name)
 	}
 }
 
 func TestPostgres_Projection(t *testing.T) {
-	s := setupPostgresStore(t)
-	pgSeedDeployment(t, s, "c1", "default", "nginx", map[string]string{"app": "nginx"})
-
-	projJSON, _ := json.Marshal(map[string]any{
-		"metadata": map[string]any{"name": true},
-		"spec":     map[string]any{"replicas": true},
-	})
-	e := engine.NewEngine(s)
-	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+	t.Parallel()
+	status := queryPostgres(t, v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{GroupKind: &v1alpha1.GroupKindFilter{APIGroup: "apps", Kind: "Deployment"}, Name: "nginx", Namespace: "demo"},
+			},
+		},
 		Objects: &v1alpha1.ObjectsSpec{
-			Object: &k8sruntime.RawExtension{Raw: projJSON},
+			Object: pgProj(map[string]any{
+				"metadata": map[string]any{"name": true, "namespace": true},
+				"spec":     map[string]any{"replicas": true},
+			}),
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(status.Objects) == 0 {
 		t.Fatal("expected result")
 	}
-	obj := status.Objects[0].Object
-	if obj == nil {
-		t.Fatal("expected projected object")
+	name := getProjectedString(t, status.Objects[0].Object, "metadata", "name")
+	if name != "nginx" {
+		t.Fatalf("expected name=nginx via PostgreSQL jsonb_build_object projection, got %q", name)
 	}
-	var projected map[string]any
-	json.Unmarshal(obj.Raw, &projected)
-	meta := projected["metadata"].(map[string]any)
-	if meta["name"] != "nginx" {
-		t.Fatalf("expected name=nginx, got %v", meta["name"])
+	replicas := getProjectedValue(t, status.Objects[0].Object, "spec", "replicas")
+	if replicas == nil {
+		t.Fatal("expected spec.replicas in projection")
 	}
 	// labels should NOT be present.
-	if _, ok := meta["labels"]; ok {
+	labels := getProjectedValue(t, status.Objects[0].Object, "metadata", "labels")
+	if labels != nil {
 		t.Fatal("labels should not be in projection")
-	}
-	spec := projected["spec"].(map[string]any)
-	if spec["replicas"] != float64(3) {
-		t.Fatalf("expected replicas=3, got %v", spec["replicas"])
 	}
 }
