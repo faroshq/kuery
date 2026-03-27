@@ -4,7 +4,6 @@ package e2e_test
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -17,14 +16,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/k3s"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 var (
-	serverURL  string
-	httpClient *http.Client
-	tmpDir     string
-	kueryCmd   *exec.Cmd
+	// serverURL is the SQLite-backed kuery server (used by most tests).
+	serverURL string
+	// pgServerURL is the PostgreSQL-backed kuery server (used by TestPostgres_* tests).
+	pgServerURL string
+	httpClient  *http.Client
+	tmpDir      string
 )
 
 func TestMain(m *testing.M) {
@@ -105,44 +109,100 @@ func TestMain(m *testing.M) {
 		log.Fatalf("build kuery: %v", err)
 	}
 
-	// 6. Find a free port.
+	kubeconfigs := fmt.Sprintf("cluster-a=%s,cluster-b=%s", kcA, kcB)
+
+	// 6. Start SQLite-backed kuery server.
+	serverURL, err = startKueryServer(ctx, kueryBin, tmpDir, "sqlite",
+		filepath.Join(tmpDir, "kuery.db"), kubeconfigs, "kuery-sqlite.log")
+	if err != nil {
+		log.Fatalf("start SQLite kuery server: %v", err)
+	}
+
+	// 7. Start PostgreSQL container + Postgres-backed kuery server.
+	log.Println("Starting PostgreSQL container...")
+	pgContainer, err := postgres.Run(ctx, "postgres:16",
+		postgres.WithDatabase("kuery_e2e"),
+		postgres.WithUsername("kuery"),
+		postgres.WithPassword("kuery"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(30*time.Second)),
+	)
+	if err != nil {
+		log.Fatalf("start postgres container: %v", err)
+	}
+	defer pgContainer.Terminate(ctx)
+
+	pgConnStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		log.Fatalf("get postgres connection string: %v", err)
+	}
+
+	pgServerURL, err = startKueryServer(ctx, kueryBin, tmpDir, "postgres",
+		pgConnStr, kubeconfigs, "kuery-postgres.log")
+	if err != nil {
+		log.Fatalf("start Postgres kuery server: %v", err)
+	}
+
+	// 8. Wait for both servers to sync data.
+	log.Println("Waiting for SQLite server data sync...")
+	if err := waitForDataSync(serverURL, httpClient); err != nil {
+		dumpLogFile(filepath.Join(tmpDir, "kuery-sqlite.log"))
+		log.Fatalf("SQLite data sync: %v", err)
+	}
+	log.Println("Waiting for Postgres server data sync...")
+	if err := waitForDataSync(pgServerURL, httpClient); err != nil {
+		dumpLogFile(filepath.Join(tmpDir, "kuery-postgres.log"))
+		log.Fatalf("Postgres data sync: %v", err)
+	}
+
+	log.Println("Setup complete, running tests...")
+	code = m.Run()
+}
+
+// startKueryServer starts a kuery server as a subprocess and waits for API readiness.
+// Returns the server URL.
+func startKueryServer(ctx context.Context, kueryBin, tmpDir, driver, dsn, kubeconfigs, logFileName string) (string, error) {
 	port, err := getFreePort()
 	if err != nil {
-		log.Fatalf("find free port: %v", err)
+		return "", fmt.Errorf("find free port: %w", err)
 	}
-	serverURL = fmt.Sprintf("https://localhost:%d", port)
+	url := fmt.Sprintf("https://localhost:%d", port)
 
-	// 7. Start kuery server.
-	log.Printf("Starting kuery on port %d...\n", port)
-	logFile, err := os.Create(filepath.Join(tmpDir, "kuery.log"))
+	log.Printf("Starting kuery (%s) on port %d...\n", driver, port)
+	logFile, err := os.Create(filepath.Join(tmpDir, logFileName))
 	if err != nil {
-		log.Fatalf("create log file: %v", err)
+		return "", fmt.Errorf("create log file: %w", err)
 	}
-	defer logFile.Close()
 
-	kueryCmd = exec.Command(kueryBin,
-		"--store-driver=sqlite",
-		"--store-dsn="+filepath.Join(tmpDir, "kuery.db"),
+	cmd := exec.Command(kueryBin,
+		"--store-driver="+driver,
+		"--store-dsn="+dsn,
 		fmt.Sprintf("--secure-port=%d", port),
-		fmt.Sprintf("--kubeconfigs=cluster-a=%s,cluster-b=%s", kcA, kcB),
+		"--kubeconfigs="+kubeconfigs,
 		"--sync-blacklist=events,events.events.k8s.io",
 	)
-	kueryCmd.Stdout = logFile
-	kueryCmd.Stderr = logFile
-	if err := kueryCmd.Start(); err != nil {
-		log.Fatalf("start kuery: %v", err)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return "", fmt.Errorf("start kuery: %w", err)
 	}
-	defer func() {
-		if kueryCmd.Process != nil {
-			kueryCmd.Process.Kill()
-			kueryCmd.Wait()
+
+	// Register cleanup.
+	go func() {
+		<-ctx.Done()
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
 		}
+		logFile.Close()
 	}()
 
-	// 8. Wait for API readiness.
-	log.Println("Waiting for kuery API...")
+	// Wait for API readiness.
 	err = waitForCondition(60*time.Second, time.Second, func() bool {
-		resp, err := httpClient.Get(serverURL + "/apis/kuery.io/v1alpha1")
+		resp, err := httpClient.Get(url + "/apis/kuery.io/v1alpha1")
 		if err != nil {
 			return false
 		}
@@ -151,19 +211,19 @@ func TestMain(m *testing.M) {
 		return strings.Contains(string(body), "kuery.io")
 	})
 	if err != nil {
-		dumpLog(tmpDir)
-		log.Fatalf("kuery API not ready: %v", err)
+		cmd.Process.Kill()
+		logFile.Close()
+		return "", fmt.Errorf("API not ready: %w", err)
 	}
 
-	// 9. Wait for data sync.
-	log.Println("Waiting for data sync...")
-	syncClient := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-	}
-	err = waitForCondition(90*time.Second, 2*time.Second, func() bool {
+	return url, nil
+}
+
+// waitForDataSync polls the query API until Deployments from both clusters are synced.
+func waitForDataSync(url string, client *http.Client) error {
+	return waitForCondition(90*time.Second, 2*time.Second, func() bool {
 		body := `{"apiVersion":"kuery.io/v1alpha1","kind":"Query","spec":{"filter":{"objects":[{"groupKind":{"apiGroup":"apps","kind":"Deployment"},"namespace":"demo"}]},"count":true}}`
-		resp, err := syncClient.Post(serverURL+"/apis/kuery.io/v1alpha1/queries", "application/json", strings.NewReader(body))
+		resp, err := client.Post(url+"/apis/kuery.io/v1alpha1/queries", "application/json", strings.NewReader(body))
 		if err != nil {
 			return false
 		}
@@ -173,13 +233,6 @@ func TestMain(m *testing.M) {
 			!strings.Contains(string(respBody), `"count":0`) &&
 			!strings.Contains(string(respBody), `"count":1`)
 	})
-	if err != nil {
-		dumpLog(tmpDir)
-		log.Fatalf("data sync not ready: %v", err)
-	}
-
-	log.Println("Setup complete, running tests...")
-	code = m.Run()
 }
 
 func getFreePort() (int, error) {
@@ -206,8 +259,8 @@ func findRepoRoot() string {
 	}
 }
 
-func dumpLog(tmpDir string) {
-	data, err := os.ReadFile(filepath.Join(tmpDir, "kuery.log"))
+func dumpLogFile(path string) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
@@ -216,7 +269,7 @@ func dumpLog(tmpDir string) {
 	if len(lines) > 50 {
 		start = len(lines) - 50
 	}
-	log.Println("=== kuery server log (last 50 lines) ===")
+	log.Printf("=== %s (last 50 lines) ===\n", filepath.Base(path))
 	for _, line := range lines[start:] {
 		log.Println(line)
 	}
