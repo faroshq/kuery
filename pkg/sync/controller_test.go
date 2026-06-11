@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/faroshq/kuery/internal/store"
+	"github.com/faroshq/kuery/pkg/store"
 )
 
 func TestSyncController_EngageDisengage(t *testing.T) {

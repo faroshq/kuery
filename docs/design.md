@@ -817,7 +817,7 @@ github.com/faroshq/kuery/
 │   ├── types.go              # Query CRD types
 │   ├── groupversion_info.go  # Scheme registration
 │   └── doc.go
-├── internal/
+├── pkg/
 │   ├── sync/
 │   │   ├── controller.go     # multicluster-runtime reconciler
 │   │   ├── handler.go        # informer event handlers

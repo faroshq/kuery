@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/faroshq/kuery/apis/query/v1alpha1"
-	"github.com/faroshq/kuery/internal/metrics"
-	"github.com/faroshq/kuery/internal/store"
+	"github.com/faroshq/kuery/pkg/metrics"
+	"github.com/faroshq/kuery/pkg/store"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"

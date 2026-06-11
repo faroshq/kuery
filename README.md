@@ -572,7 +572,7 @@ github.com/faroshq/kuery/
 ├── cmd/kuery/               # Server entrypoint
 ├── deploy/                  # Dockerfile + Kubernetes manifests
 ├── docs/                    # Design document
-└── internal/
+└── pkg/
     ├── engine/              # Query engine (SQL generator, projection, relations, tree assembly)
     ├── gc/                  # Cluster garbage collector
     ├── metrics/             # Prometheus metrics
