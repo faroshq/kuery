@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/faroshq/kuery/apis/query/v1alpha1"
-	"github.com/faroshq/kuery/internal/store"
+	"github.com/faroshq/kuery/pkg/store"
 
 	"github.com/google/uuid"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

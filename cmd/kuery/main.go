@@ -10,9 +10,9 @@ import (
 	"syscall"
 
 	"github.com/faroshq/kuery/apis/query/v1alpha1"
-	"github.com/faroshq/kuery/internal/server"
-	"github.com/faroshq/kuery/internal/store"
-	kuerysync "github.com/faroshq/kuery/internal/sync"
+	"github.com/faroshq/kuery/pkg/server"
+	"github.com/faroshq/kuery/pkg/store"
+	kuerysync "github.com/faroshq/kuery/pkg/sync"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"

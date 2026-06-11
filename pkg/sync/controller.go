@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/faroshq/kuery/internal/store"
+	"github.com/faroshq/kuery/pkg/store"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"

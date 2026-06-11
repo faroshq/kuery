@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/faroshq/kuery/internal/metrics"
-	"github.com/faroshq/kuery/internal/store"
+	"github.com/faroshq/kuery/pkg/metrics"
+	"github.com/faroshq/kuery/pkg/store"
 )
 
 // GarbageCollector cleans up stale clusters and their objects.

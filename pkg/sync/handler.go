@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/faroshq/kuery/internal/store"
+	"github.com/faroshq/kuery/pkg/store"
 	"github.com/google/uuid"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
