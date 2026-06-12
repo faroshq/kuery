@@ -30,3 +30,30 @@ func NewBlacklist(gvrs []schema.GroupVersionResource) *Blacklist {
 func (b *Blacklist) IsBlacklisted(gr schema.GroupResource) bool {
 	return b.entries[gr]
 }
+
+// Whitelist, when configured, restricts which resources are SYNCED. Unlike
+// the blacklist (sensitive resources, skipped entirely), non-whitelisted
+// resources still appear in resource_types — they just don't get informers.
+// A nil *Whitelist allows everything, so callers can pass it through
+// unconditionally.
+type Whitelist struct {
+	entries map[schema.GroupResource]bool
+}
+
+// NewWhitelist creates a Whitelist from a list of GVRs.
+func NewWhitelist(gvrs []schema.GroupVersionResource) *Whitelist {
+	w := &Whitelist{entries: make(map[schema.GroupResource]bool)}
+	for _, gvr := range gvrs {
+		w.entries[gvr.GroupResource()] = true
+	}
+	return w
+}
+
+// Allows returns true when the group-resource should be synced. A nil
+// whitelist allows everything.
+func (w *Whitelist) Allows(gr schema.GroupResource) bool {
+	if w == nil {
+		return true
+	}
+	return w.entries[gr]
+}

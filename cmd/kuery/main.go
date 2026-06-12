@@ -51,6 +51,7 @@ type Options struct {
 	// Default: "secrets,events,events.events.k8s.io"
 	// Set to empty string to sync everything.
 	SyncBlacklist string
+	SyncWhitelist string
 }
 
 // NewOptions creates default options.
@@ -60,6 +61,7 @@ func NewOptions() *Options {
 		StoreDriver:   "sqlite",
 		StoreDSN:      "kuery.db",
 		SyncBlacklist: "secrets,events,events.events.k8s.io",
+		SyncWhitelist: "",
 	}
 	o.SecureServing.BindPort = 6443
 	return o
@@ -73,6 +75,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.SyncEnabled, "sync-enabled", o.SyncEnabled, "Enable sync controller to watch clusters")
 	fs.StringVar(&o.Kubeconfigs, "kubeconfigs", o.Kubeconfigs, "Comma-separated list of name=path pairs for clusters to sync (e.g. cluster-a=/path/a.kubeconfig,cluster-b=/path/b.kubeconfig)")
 	fs.StringVar(&o.SyncBlacklist, "sync-blacklist", o.SyncBlacklist, "Comma-separated resources to skip syncing (default: secrets,events,events.events.k8s.io). Empty string syncs everything.")
+	fs.StringVar(&o.SyncWhitelist, "sync-whitelist", o.SyncWhitelist, "Comma-separated resources to sync exclusively (resource or resource.group). Empty syncs everything watchable; the blacklist still applies. Non-whitelisted types remain discoverable in resource_types.")
 }
 
 // Complete fills in fields required to have valid data.
@@ -117,25 +120,35 @@ func (o *Options) parseKubeconfigs() (map[string]string, error) {
 
 // buildBlacklist creates a Blacklist from the --sync-blacklist flag.
 func (o *Options) buildBlacklist() *kuerysync.Blacklist {
-	if o.SyncBlacklist == "" {
-		return kuerysync.NewBlacklist(nil)
+	return kuerysync.NewBlacklist(parseGVRList(o.SyncBlacklist))
+}
+
+// buildWhitelist creates a Whitelist from the --sync-whitelist flag.
+// Empty flag means nil (sync everything watchable).
+func (o *Options) buildWhitelist() *kuerysync.Whitelist {
+	gvrs := parseGVRList(o.SyncWhitelist)
+	if gvrs == nil {
+		return nil
 	}
+	return kuerysync.NewWhitelist(gvrs)
+}
+
+// parseGVRList parses a comma-separated "resource" / "resource.group" list.
+func parseGVRList(raw string) []schema.GroupVersionResource {
 	var gvrs []schema.GroupVersionResource
-	for _, entry := range strings.Split(o.SyncBlacklist, ",") {
+	for _, entry := range strings.Split(raw, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
-		// Format: "resource" or "resource.group"
 		parts := strings.SplitN(entry, ".", 2)
-		resource := parts[0]
 		group := ""
 		if len(parts) == 2 {
 			group = parts[1]
 		}
-		gvrs = append(gvrs, schema.GroupVersionResource{Group: group, Resource: resource})
+		gvrs = append(gvrs, schema.GroupVersionResource{Group: group, Resource: parts[0]})
 	}
-	return kuerysync.NewBlacklist(gvrs)
+	return gvrs
 }
 
 // Run starts the kuery API server.
@@ -199,6 +212,7 @@ func (o *Options) Run(ctx context.Context) error {
 	syncController := kuerysync.NewSyncController(kuerysync.Config{
 		Store:     s,
 		Blacklist: blacklist,
+		Whitelist: o.buildWhitelist(),
 	})
 
 	// Engage clusters from --kubeconfigs flag.

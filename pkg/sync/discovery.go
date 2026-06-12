@@ -25,8 +25,15 @@ type DiscoveredResource struct {
 }
 
 // RunDiscovery discovers all API resources for a cluster and populates the
-// resource_types table. Returns the list of watchable resources (those with list+watch verbs).
-func RunDiscovery(ctx context.Context, clusterName string, dc discovery.DiscoveryInterface, s store.Store, bl *Blacklist) ([]DiscoveredResource, error) {
+// resource_types table. Returns the list of watchable resources (those with
+// list+watch verbs).
+//
+// Filtering: blacklisted resources are skipped entirely (not even recorded
+// as types — they are sensitive). A non-nil whitelist additionally
+// restricts which resources are WATCHED; non-whitelisted types are still
+// recorded in resource_types so kind/category resolution keeps working,
+// they just don't sync any objects.
+func RunDiscovery(ctx context.Context, clusterName string, dc discovery.DiscoveryInterface, s store.Store, bl *Blacklist, wl *Whitelist) ([]DiscoveredResource, error) {
 	logger := klog.FromContext(ctx)
 
 	// Get all server resources (groups + resources).
@@ -99,8 +106,9 @@ func RunDiscovery(ctx context.Context, clusterName string, dc discovery.Discover
 				continue
 			}
 
-			// Check if the resource supports list and watch verbs.
-			if hasVerbs(ar.Verbs, "list", "watch") {
+			// Check if the resource supports list and watch verbs, and —
+			// when a whitelist is configured — that it is allowed to sync.
+			if hasVerbs(ar.Verbs, "list", "watch") && wl.Allows(gr) {
 				watchable = append(watchable, DiscoveredResource{
 					GVR:        schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: ar.Name},
 					Kind:       ar.Kind,

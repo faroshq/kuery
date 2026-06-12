@@ -21,9 +21,13 @@ const DefaultResyncPeriod = 10 * time.Minute
 
 // Config holds configuration for the SyncController.
 type Config struct {
-	Store         store.Store
-	Blacklist     *Blacklist
-	ResyncPeriod  time.Duration
+	Store     store.Store
+	Blacklist *Blacklist
+	// Whitelist, when non-nil, restricts which resources are synced (the
+	// blacklist still applies on top). Nil syncs everything watchable.
+	// Non-whitelisted types are still recorded in resource_types.
+	Whitelist    *Whitelist
+	ResyncPeriod time.Duration
 }
 
 // SyncController manages per-cluster informers that sync Kubernetes objects into the store.
@@ -89,7 +93,7 @@ func (sc *SyncController) Engage(ctx context.Context, clusterName string, cl clu
 	}
 
 	// Run discovery to populate resource_types and get watchable resources.
-	watchable, err := RunDiscovery(ctx, clusterName, dc, sc.config.Store, sc.config.Blacklist)
+	watchable, err := RunDiscovery(ctx, clusterName, dc, sc.config.Store, sc.config.Blacklist, sc.config.Whitelist)
 	if err != nil {
 		return fmt.Errorf("discovery failed for cluster %s: %w", clusterName, err)
 	}
@@ -208,7 +212,7 @@ func (sc *SyncController) watchCRDs(ctx context.Context, clusterName string, cl 
 			}
 			lastRefresh = now
 			logger.Info("CRD change detected, refreshing discovery")
-			if _, err := RunDiscovery(ctx, clusterName, dc, sc.config.Store, sc.config.Blacklist); err != nil {
+			if _, err := RunDiscovery(ctx, clusterName, dc, sc.config.Store, sc.config.Blacklist, sc.config.Whitelist); err != nil {
 				logger.Error(err, "discovery refresh failed")
 			}
 		},
