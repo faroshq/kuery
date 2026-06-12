@@ -833,3 +833,55 @@ func TestEngine_JSONPathFilter(t *testing.T) {
 		t.Fatalf("expected 1 object with spec.replicas, got %d", len(status.Objects))
 	}
 }
+
+// TestEngine_FilterByDottedLabelKey runs against REAL SQLite: standard
+// Kubernetes label keys contain dots and slashes, which the old
+// '$.{key}'-interpolated path parsed as nested segments (silently matching
+// nothing). The quoted-key bound path must address the single map key.
+func TestEngine_FilterByDottedLabelKey(t *testing.T) {
+	s := setupTestStore(t)
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", map[string]string{"app.kubernetes.io/name": "nginx"}, ts("2025-06-01T00:00:00Z")),
+		makeDeployment("cluster-a", "default", "redis", map[string]string{"app.kubernetes.io/name": "redis"}, ts("2025-06-01T00:00:00Z")),
+	)
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{Labels: map[string]string{"app.kubernetes.io/name": "nginx"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 1 {
+		t.Fatalf("expected 1 object for dotted label key, got %d", len(status.Objects))
+	}
+}
+
+// TestEngine_HostileLabelKeyIsInert runs a query with an injection-shaped
+// label key against real SQLite: it must execute cleanly and match nothing
+// (the key is data, not SQL).
+func TestEngine_HostileLabelKeyIsInert(t *testing.T) {
+	s := setupTestStore(t)
+	seedObjects(t, s,
+		makeDeployment("cluster-a", "default", "nginx", map[string]string{"app": "nginx"}, ts("2025-06-01T00:00:00Z")),
+	)
+
+	e := NewEngine(s)
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{Labels: map[string]string{`x") OR 1=1 --`: "v"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("hostile key must be inert, got error: %v", err)
+	}
+	if len(status.Objects) != 0 {
+		t.Fatalf("hostile key matched %d objects, want 0", len(status.Objects))
+	}
+}
