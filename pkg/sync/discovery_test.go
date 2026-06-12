@@ -73,7 +73,7 @@ func TestRunDiscovery(t *testing.T) {
 	}
 
 	bl := NewBlacklist(DefaultBlacklist) // secrets and events blacklisted
-	watchable, err := RunDiscovery(ctx, "test-cluster", fakeDiscovery, s, bl)
+	watchable, err := RunDiscovery(ctx, "test-cluster", fakeDiscovery, s, bl, nil)
 	if err != nil {
 		t.Fatalf("RunDiscovery failed: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestRunDiscovery_ClearsOldEntries(t *testing.T) {
 	}
 
 	bl := NewBlacklist(nil)
-	_, err := RunDiscovery(ctx, "test-cluster", fakeDiscovery, s, bl)
+	_, err := RunDiscovery(ctx, "test-cluster", fakeDiscovery, s, bl, nil)
 	if err != nil {
 		t.Fatalf("RunDiscovery failed: %v", err)
 	}
@@ -177,5 +177,77 @@ func TestBlacklist_Empty(t *testing.T) {
 	bl := NewBlacklist(nil)
 	if bl.IsBlacklisted(schema.GroupResource{Group: "", Resource: "secrets"}) {
 		t.Error("empty blacklist should not blacklist anything")
+	}
+}
+
+// TestRunDiscovery_Whitelist verifies whitelist semantics: only
+// whitelisted resources are watchable, but non-whitelisted (and
+// non-blacklisted) types are still recorded in resource_types so
+// kind/category resolution keeps working.
+func TestRunDiscovery_Whitelist(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	fakeClient := fakeclientset.NewSimpleClientset()
+	fakeDiscovery := fakeClient.Discovery().(*fakediscovery.FakeDiscovery)
+	fakeDiscovery.Resources = []*metav1.APIResourceList{
+		{
+			GroupVersion: "v1",
+			APIResources: []metav1.APIResource{
+				{Name: "pods", Kind: "Pod", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+				{Name: "configmaps", Kind: "ConfigMap", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+				{Name: "secrets", Kind: "Secret", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+			},
+		},
+		{
+			GroupVersion: "apps/v1",
+			APIResources: []metav1.APIResource{
+				{Name: "deployments", Kind: "Deployment", Namespaced: true, Verbs: metav1.Verbs{"get", "list", "watch"}},
+			},
+		},
+	}
+
+	bl := NewBlacklist(DefaultBlacklist)
+	wl := NewWhitelist([]schema.GroupVersionResource{
+		{Group: "", Resource: "pods"},
+		{Group: "apps", Resource: "deployments"},
+	})
+	watchable, err := RunDiscovery(ctx, "test-cluster", fakeDiscovery, s, bl, wl)
+	if err != nil {
+		t.Fatalf("RunDiscovery failed: %v", err)
+	}
+
+	// Only the whitelisted pair syncs.
+	if len(watchable) != 2 {
+		t.Errorf("expected 2 watchable resources, got %d", len(watchable))
+		for _, w := range watchable {
+			t.Logf("  watchable: %s", w.GVR.String())
+		}
+	}
+	for _, w := range watchable {
+		if w.GVR.Resource == "configmaps" || w.GVR.Resource == "secrets" {
+			t.Errorf("%s must not be watchable", w.GVR.Resource)
+		}
+	}
+
+	// configmaps (non-whitelisted) is still a known TYPE; secrets
+	// (blacklisted) is not recorded at all.
+	var count int64
+	s.RawDB().Model(&store.ResourceTypeModel{}).Where("cluster = ? AND resource = ?", "test-cluster", "configmaps").Count(&count)
+	if count != 1 {
+		t.Errorf("non-whitelisted configmaps missing from resource_types (count=%d)", count)
+	}
+	s.RawDB().Model(&store.ResourceTypeModel{}).Where("cluster = ? AND resource = ?", "test-cluster", "secrets").Count(&count)
+	if count != 0 {
+		t.Errorf("blacklisted secrets recorded in resource_types (count=%d)", count)
+	}
+}
+
+// TestWhitelist_NilAllowsEverything pins the pass-through contract callers
+// rely on (Config.Whitelist is optional).
+func TestWhitelist_NilAllowsEverything(t *testing.T) {
+	var wl *Whitelist
+	if !wl.Allows(schema.GroupResource{Resource: "pods"}) {
+		t.Fatal("nil whitelist must allow everything")
 	}
 }
