@@ -501,8 +501,8 @@ func (g *Generator) buildRootClauses(spec *v1alpha1.QuerySpec, alias string) ([]
 					labelsJSON, _ := json.Marshal(map[string]string{k: v})
 					args = append(args, string(labelsJSON))
 				default:
-					whereClauses = append(whereClauses, fmt.Sprintf("json_extract(cl.labels, '$.%s') = ?", k))
-					args = append(args, v)
+					whereClauses = append(whereClauses, "json_extract(cl.labels, ?) = ?")
+					args = append(args, sqliteLabelPath(k), v)
 				}
 			}
 		}
@@ -610,8 +610,8 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 			args = append(args, string(labelsJSON))
 		default:
 			for k, v := range f.Labels {
-				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') = ?", alias, k))
-				args = append(args, v)
+				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, ?) = ?", alias))
+				args = append(args, sqliteLabelPath(k), v)
 			}
 		}
 	}
@@ -681,7 +681,12 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 		}
 	}
 
-	// Label expressions (In, NotIn, Exists, DoesNotExist).
+	// Label expressions (In, NotIn, Exists, DoesNotExist). Keys are
+	// caller-controlled and MUST be bound parameters, never interpolated:
+	// SQLite takes a quoted-key JSON path argument (also what makes dotted
+	// keys like app.kubernetes.io/name address ONE map key), Postgres takes
+	// the key as the ->> operand / jsonb_exists() argument (the `?`
+	// existence operator is avoided — it collides with placeholders).
 	for _, expr := range f.LabelExpressions {
 		switch expr.Operator {
 		case v1alpha1.LabelOpIn:
@@ -689,13 +694,17 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 				placeholders := make([]string, len(expr.Values))
 				for i := range expr.Values {
 					placeholders[i] = "?"
-					args = append(args, expr.Values[i])
 				}
 				switch g.dialect {
 				case "postgres":
-					clauses = append(clauses, fmt.Sprintf("%s.labels->>'%s' IN (%s)", alias, expr.Key, strings.Join(placeholders, ", ")))
+					clauses = append(clauses, fmt.Sprintf("%s.labels->>? IN (%s)", alias, strings.Join(placeholders, ", ")))
+					args = append(args, expr.Key)
 				default:
-					clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') IN (%s)", alias, expr.Key, strings.Join(placeholders, ", ")))
+					clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, ?) IN (%s)", alias, strings.Join(placeholders, ", ")))
+					args = append(args, sqliteLabelPath(expr.Key))
+				}
+				for _, v := range expr.Values {
+					args = append(args, v)
 				}
 			}
 		case v1alpha1.LabelOpNotIn:
@@ -703,28 +712,36 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 				placeholders := make([]string, len(expr.Values))
 				for i := range expr.Values {
 					placeholders[i] = "?"
-					args = append(args, expr.Values[i])
 				}
 				switch g.dialect {
 				case "postgres":
-					clauses = append(clauses, fmt.Sprintf("(%s.labels->>'%s' IS NULL OR %s.labels->>'%s' NOT IN (%s))", alias, expr.Key, alias, expr.Key, strings.Join(placeholders, ", ")))
+					clauses = append(clauses, fmt.Sprintf("(%s.labels->>? IS NULL OR %s.labels->>? NOT IN (%s))", alias, alias, strings.Join(placeholders, ", ")))
+					args = append(args, expr.Key, expr.Key)
 				default:
-					clauses = append(clauses, fmt.Sprintf("(json_extract(%s.labels, '$.%s') IS NULL OR json_extract(%s.labels, '$.%s') NOT IN (%s))", alias, expr.Key, alias, expr.Key, strings.Join(placeholders, ", ")))
+					clauses = append(clauses, fmt.Sprintf("(json_extract(%s.labels, ?) IS NULL OR json_extract(%s.labels, ?) NOT IN (%s))", alias, alias, strings.Join(placeholders, ", ")))
+					args = append(args, sqliteLabelPath(expr.Key), sqliteLabelPath(expr.Key))
+				}
+				for _, v := range expr.Values {
+					args = append(args, v)
 				}
 			}
 		case v1alpha1.LabelOpExists:
 			switch g.dialect {
 			case "postgres":
-				clauses = append(clauses, fmt.Sprintf("%s.labels ? '%s'", alias, expr.Key))
+				clauses = append(clauses, fmt.Sprintf("jsonb_exists(%s.labels, ?)", alias))
+				args = append(args, expr.Key)
 			default:
-				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') IS NOT NULL", alias, expr.Key))
+				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, ?) IS NOT NULL", alias))
+				args = append(args, sqliteLabelPath(expr.Key))
 			}
 		case v1alpha1.LabelOpDoesNotExist:
 			switch g.dialect {
 			case "postgres":
-				clauses = append(clauses, fmt.Sprintf("NOT (%s.labels ? '%s')", alias, expr.Key))
+				clauses = append(clauses, fmt.Sprintf("NOT jsonb_exists(%s.labels, ?)", alias))
+				args = append(args, expr.Key)
 			default:
-				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') IS NULL", alias, expr.Key))
+				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, ?) IS NULL", alias))
+				args = append(args, sqliteLabelPath(expr.Key))
 			}
 		}
 	}
@@ -873,4 +890,15 @@ func SortMapKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// sqliteLabelPath renders the JSON path addressing one label key, for use
+// as a BOUND PARAMETER of json_extract — never interpolated into the SQL
+// string (label keys are caller-controlled). The quoted-key syntax makes
+// dotted/slashed Kubernetes label keys (app.kubernetes.io/name) address a
+// single map key instead of being parsed as nested path segments.
+func sqliteLabelPath(key string) string {
+	escaped := strings.ReplaceAll(key, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `$."` + escaped + `"`
 }

@@ -259,8 +259,10 @@ func TestSQL_LabelsFilter(t *testing.T) {
 		},
 	})
 
-	// Label filter: json_extract for SQLite.
-	assertContains(t, q.SQL, "json_extract(obj.labels, '$.app') = ?")
+	// Label filter: json_extract for SQLite — the path is a BOUND ARG
+	// (quoted-key syntax), never interpolated; see sqliteLabelPath.
+	assertContains(t, q.SQL, "json_extract(obj.labels, ?) = ?")
+	assertArgValue(t, q.Args, `$."app"`)
 	assertContains(t, q.SQL, "obj.namespace = ?")
 	// Custom ordering with tiebreaker.
 	assertContains(t, q.SQL, "ORDER BY obj.kind ASC")
@@ -445,7 +447,8 @@ func TestSQL_LabelExpression_In(t *testing.T) {
 			},
 		},
 	})
-	assertContains(t, q.SQL, "json_extract(obj.labels, '$.env') IN (?, ?)")
+	assertContains(t, q.SQL, "json_extract(obj.labels, ?) IN (?, ?)")
+	assertArgValue(t, q.Args, `$."env"`)
 }
 
 func TestSQL_LabelExpression_Exists(t *testing.T) {
@@ -458,7 +461,8 @@ func TestSQL_LabelExpression_Exists(t *testing.T) {
 			},
 		},
 	})
-	assertContains(t, q.SQL, "json_extract(obj.labels, '$.env') IS NOT NULL")
+	assertContains(t, q.SQL, "json_extract(obj.labels, ?) IS NOT NULL")
+	assertArgValue(t, q.Args, `$."env"`)
 }
 
 func TestSQL_LabelExpression_DoesNotExist(t *testing.T) {
@@ -471,7 +475,8 @@ func TestSQL_LabelExpression_DoesNotExist(t *testing.T) {
 			},
 		},
 	})
-	assertContains(t, q.SQL, "json_extract(obj.labels, '$.deprecated') IS NULL")
+	assertContains(t, q.SQL, "json_extract(obj.labels, ?) IS NULL")
+	assertArgValue(t, q.Args, `$."deprecated"`)
 }
 
 // --- JSONPath filter ---
@@ -558,4 +563,55 @@ func TestSQL_CategoriesFilter(t *testing.T) {
 	})
 	assertContains(t, q.SQL, "EXISTS (SELECT 1 FROM resource_types")
 	assertContains(t, q.SQL, "json_each(rt.categories)")
+}
+
+// assertArgValue asserts one of the generated args equals want.
+func assertArgValue(t *testing.T, args []any, want any) {
+	t.Helper()
+	for _, a := range args {
+		if a == want {
+			return
+		}
+	}
+	t.Fatalf("args %v missing %v", args, want)
+}
+
+// --- Label key safety (caller-controlled keys must never reach the SQL) ---
+
+// TestSQL_LabelKeyNotInterpolated locks in the security property: a hostile
+// label KEY shows up only in Args, never in the SQL string.
+func TestSQL_LabelKeyNotInterpolated(t *testing.T) {
+	hostile := `x') OR 1=1 --`
+	q := gen(t, &v1alpha1.QuerySpec{
+		Cluster: &v1alpha1.ClusterFilter{Labels: map[string]string{hostile: "v"}},
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{Labels: map[string]string{hostile: "v"}},
+				{LabelExpressions: []v1alpha1.LabelExpression{
+					{Key: hostile, Operator: v1alpha1.LabelOpExists},
+					{Key: hostile, Operator: v1alpha1.LabelOpIn, Values: []string{"a"}},
+					{Key: hostile, Operator: v1alpha1.LabelOpNotIn, Values: []string{"a"}},
+					{Key: hostile, Operator: v1alpha1.LabelOpDoesNotExist},
+				}},
+			},
+		},
+	})
+	if strings.Contains(q.SQL, "1=1") {
+		t.Fatalf("hostile label key interpolated into SQL: %s", q.SQL)
+	}
+	assertArgValue(t, q.Args, `$."x') OR 1=1 --"`)
+}
+
+// TestSQL_DottedLabelKeyAddressesOneKey locks in the correctness fix:
+// standard Kubernetes label keys contain dots and slashes and must address
+// ONE map key via the quoted-key JSON path, not nested path segments.
+func TestSQL_DottedLabelKeyAddressesOneKey(t *testing.T) {
+	q := gen(t, &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{
+				{Labels: map[string]string{"app.kubernetes.io/name": "nginx"}},
+			},
+		},
+	})
+	assertArgValue(t, q.Args, `$."app.kubernetes.io/name"`)
 }
