@@ -28,6 +28,13 @@ var ValidSortFields = map[string]string{
 
 // Validate checks a QuerySpec for correctness and applies defaults.
 func Validate(spec *v1alpha1.QuerySpec) error {
+	// Root.
+	switch spec.Root {
+	case "", v1alpha1.RootObjects, v1alpha1.RootClusters:
+	default:
+		return fmt.Errorf("unsupported root: %q (want objects or clusters)", spec.Root)
+	}
+
 	// Limit.
 	if spec.Limit <= 0 {
 		spec.Limit = DefaultLimit
