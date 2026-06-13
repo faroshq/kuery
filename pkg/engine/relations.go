@@ -18,6 +18,15 @@ const (
 	RelEvents      = "events"
 	RelLinked      = "linked"
 	RelGrouped     = "grouped"
+	// RelNamespace: a namespaced object → the Namespace object it lives in.
+	// RelNamespaced is the reverse: a Namespace → every object it contains.
+	// Both are intra-cluster (a Namespace and its members share a cluster).
+	RelNamespace  = "namespace"
+	RelNamespaced = "namespaced"
+	// RelMembers: a cluster node → every object in that cluster. Used with a
+	// clusters-rooted query (spec.root=clusters) to expand the per-cluster
+	// tree. The parent's cluster column carries the cluster name.
+	RelMembers = "members"
 )
 
 // IsTransitive returns true if the relation name ends with "+".
@@ -59,6 +68,12 @@ func buildRelationJoin(relationType string, ctx relationContext) (string, []stri
 		return buildLinkedJoin(ctx)
 	case RelGrouped:
 		return buildGroupedJoin(ctx)
+	case RelNamespace:
+		return buildNamespaceJoin(ctx)
+	case RelNamespaced:
+		return buildNamespacedJoin(ctx)
+	case RelMembers:
+		return buildMembersJoin(ctx)
 	default:
 		// Unknown relation type — return empty (will produce no results).
 		return fmt.Sprintf("JOIN objects %s ON 1=0", ctx.childAlias), nil, nil
@@ -356,5 +371,51 @@ func buildGroupedJoin(ctx relationContext) (string, []string, []any) {
 			ctx.childAlias, ctx.parentAlias,
 			ctx.parentAlias)
 	}
+	return join, nil, nil
+}
+
+// buildMembersJoin: cluster node → every object in that cluster. The parent
+// (a clusters-rooted node) carries the cluster name in its cluster column, so
+// the join is plain column equality. RelationSpec.Filters/Limit (applied by
+// the generator) narrow the set, e.g. to one kind tier. Dialect-agnostic.
+func buildMembersJoin(ctx relationContext) (string, []string, []any) {
+	join := fmt.Sprintf(
+		"JOIN objects %s ON %s.cluster = %s.cluster",
+		ctx.childAlias, ctx.childAlias, ctx.parentAlias)
+	return join, nil, nil
+}
+
+// buildNamespaceJoin: namespaced object → the Namespace object it lives in.
+// A Namespace is the core-group object kind=Namespace whose name equals the
+// parent's namespace, in the same cluster. Cluster-scoped parents (namespace
+// '') resolve to nothing. Dialect-agnostic: pure column equality, no JSON.
+func buildNamespaceJoin(ctx relationContext) (string, []string, []any) {
+	join := fmt.Sprintf(
+		"JOIN objects %s ON %s.cluster = %s.cluster "+
+			"AND %s.kind = 'Namespace' AND %s.api_group = '' "+
+			"AND %s.name = %s.namespace "+
+			"AND %s.namespace != ''",
+		ctx.childAlias, ctx.childAlias, ctx.parentAlias,
+		ctx.childAlias, ctx.childAlias,
+		ctx.childAlias, ctx.parentAlias,
+		ctx.parentAlias)
+	return join, nil, nil
+}
+
+// buildNamespacedJoin: Namespace object → every object it contains (reverse of
+// buildNamespaceJoin). Members share the cluster and carry namespace = the
+// Namespace's name. Only fires when the parent is itself a Namespace. The
+// id guard keeps the Namespace from listing itself (its own namespace is '',
+// so it can't match anyway, but it's cheap insurance). Dialect-agnostic.
+func buildNamespacedJoin(ctx relationContext) (string, []string, []any) {
+	join := fmt.Sprintf(
+		"JOIN objects %s ON %s.cluster = %s.cluster "+
+			"AND %s.kind = 'Namespace' AND %s.api_group = '' "+
+			"AND %s.namespace = %s.name "+
+			"AND %s.id != %s.id",
+		ctx.childAlias, ctx.childAlias, ctx.parentAlias,
+		ctx.parentAlias, ctx.parentAlias,
+		ctx.childAlias, ctx.parentAlias,
+		ctx.childAlias, ctx.parentAlias)
 	return join, nil, nil
 }

@@ -20,8 +20,28 @@ type Query struct {
 	Status QueryStatus `json:"status,omitempty"`
 }
 
+// RootKind selects what a query roots on.
+// +enum
+type RootKind string
+
+const (
+	// RootObjects (default) roots the query on Kubernetes objects.
+	RootObjects RootKind = "objects"
+	// RootClusters roots the query on engaged clusters (the multicluster-runtime
+	// cluster anchor, backed by the clusters table). Each cluster node's
+	// "members" relation expands to the objects in that cluster.
+	RootClusters RootKind = "clusters"
+)
+
 // QuerySpec defines the desired query parameters.
 type QuerySpec struct {
+	// Root selects what the query roots on. "" / "objects" (default) returns
+	// Kubernetes objects. "clusters" returns one node per engaged cluster
+	// whose "members" relation expands to the objects in that cluster — so a
+	// single query yields the full per-cluster tree.
+	// +optional
+	Root RootKind `json:"root,omitempty"`
+
 	// Cluster filters which clusters to query.
 	// +optional
 	Cluster *ClusterFilter `json:"cluster,omitempty"`

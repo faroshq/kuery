@@ -261,6 +261,115 @@ func TestRelation_Owners(t *testing.T) {
 	}
 }
 
+func TestRelation_Namespace(t *testing.T) {
+	s := setupTestStore(t)
+	// Namespace objects are core-group, cluster-scoped (own namespace "").
+	nsDefault := makeCustomObject("cluster-a", "", "default", "", "Namespace", "namespaces")
+	nsOther := makeCustomObject("cluster-a", "", "other", "", "Namespace", "namespaces")
+	pod := makePod("cluster-a", "default", "web", nil)
+
+	seedObjects(t, s, nsDefault, nsOther, pod)
+
+	e := NewEngine(s)
+	projJSON, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": true}})
+
+	// A namespaced object resolves to exactly its own Namespace.
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{{Name: "web", Namespace: "default"}},
+		},
+		Objects: &v1alpha1.ObjectsSpec{
+			Object: &runtime.RawExtension{Raw: projJSON},
+			Relations: map[string]v1alpha1.RelationSpec{
+				"namespace": {Objects: &v1alpha1.ObjectsSpec{Object: &runtime.RawExtension{Raw: projJSON}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 1 {
+		t.Fatalf("expected 1 root object, got %d", len(status.Objects))
+	}
+	ns := status.Objects[0].Relations["namespace"]
+	if len(ns) != 1 {
+		t.Fatalf("expected 1 namespace (default), got %d", len(ns))
+	}
+
+	// The Namespace itself lists every object it contains (reverse). Filter
+	// by name only — GroupKind resolution needs resource_types, which this
+	// unit store doesn't seed; "default" uniquely identifies the Namespace.
+	status, err = e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Filter: &v1alpha1.QueryFilter{
+			Objects: []v1alpha1.ObjectFilter{{Name: "default"}},
+		},
+		Objects: &v1alpha1.ObjectsSpec{
+			Object: &runtime.RawExtension{Raw: projJSON},
+			Relations: map[string]v1alpha1.RelationSpec{
+				"namespaced": {Objects: &v1alpha1.ObjectsSpec{Object: &runtime.RawExtension{Raw: projJSON}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Objects) != 1 {
+		t.Fatalf("expected 1 Namespace root, got %d", len(status.Objects))
+	}
+	members := status.Objects[0].Relations["namespaced"]
+	if len(members) != 1 {
+		t.Fatalf("expected 1 member (web) in namespace default, got %d", len(members))
+	}
+}
+
+func TestRoot_ClustersWithMembers(t *testing.T) {
+	s := setupTestStore(t)
+
+	// Two engaged clusters, each with objects. Clusters are the
+	// multicluster-runtime anchor — rows in the clusters table.
+	for _, name := range []string{"cluster-a", "cluster-b"} {
+		if err := s.UpsertCluster(context.Background(), &store.ClusterModel{
+			Name: name, Status: "engaged", LastSeen: *ts("2025-06-01T00:00:00Z"),
+			EngagedAt: ts("2025-06-01T00:00:00Z"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedObjects(t, s,
+		makePod("cluster-a", "default", "a1", nil),
+		makePod("cluster-a", "default", "a2", nil),
+		makePod("cluster-b", "default", "b1", nil),
+	)
+
+	e := NewEngine(s)
+	projJSON, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": true}})
+
+	status, err := e.Execute(context.Background(), &v1alpha1.QuerySpec{
+		Root: v1alpha1.RootClusters,
+		Objects: &v1alpha1.ObjectsSpec{
+			ID:      true,
+			Cluster: true,
+			Relations: map[string]v1alpha1.RelationSpec{
+				"members": {Objects: &v1alpha1.ObjectsSpec{Object: &runtime.RawExtension{Raw: projJSON}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(status.Objects) != 2 {
+		t.Fatalf("expected 2 cluster roots, got %d", len(status.Objects))
+	}
+	members := map[string]int{}
+	for _, c := range status.Objects {
+		members[c.Cluster] = len(c.Relations["members"])
+	}
+	if members["cluster-a"] != 2 || members["cluster-b"] != 1 {
+		t.Fatalf("expected a=2 b=1 members, got %v", members)
+	}
+}
+
 func TestRelation_Events(t *testing.T) {
 	s := setupTestStore(t)
 	deploy := makeDeployment("cluster-a", "default", "nginx", nil, ts("2025-06-01T00:00:00Z"))

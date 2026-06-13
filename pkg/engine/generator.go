@@ -45,6 +45,15 @@ func (g *Generator) Generate(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) 
 // generateRootOnly produces SQL for a single-level (root objects) query.
 func (g *Generator) generateRootOnly(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) {
 	alias := "obj"
+
+	// Clusters-rooted, no relations: list the engaged clusters themselves.
+	if spec.Root == v1alpha1.RootClusters {
+		inner, args, countSQL, countArgs := g.buildClusterRootCTE(spec, alias)
+		selectCols := g.buildSelectCols(alias, alias+".object", g.buildPathExpr(alias), true)
+		sql := fmt.Sprintf("SELECT %s FROM (%s) %s", selectCols, inner, alias)
+		return &GeneratedQuery{SQL: sql, Args: args, CountSQL: countSQL, CountArgs: countArgs}, nil
+	}
+
 	rootWhere, rootArgs, rootJoins, err := g.buildRootClauses(spec, alias)
 	if err != nil {
 		return nil, err
@@ -124,46 +133,71 @@ func (g *Generator) generateRootOnly(spec *v1alpha1.QuerySpec) (*GeneratedQuery,
 func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) {
 	rootAlias := "l0"
 
-	rootWhere, rootArgs, rootJoins, err := g.buildRootClauses(spec, rootAlias)
-	if err != nil {
-		return nil, err
-	}
-
 	rootProj, err := g.buildProjection(spec.Objects, rootAlias)
 	if err != nil {
 		return nil, err
 	}
 	rootPath := g.buildPathExpr(rootAlias)
 
-	// Build the root inner query (with ORDER BY/LIMIT) as a CTE.
-	// This avoids ORDER BY inside UNION ALL which SQLite doesn't allow.
-	var rootInnerSB strings.Builder
-	rootInnerSB.WriteString("SELECT * FROM objects ")
-	rootInnerSB.WriteString(rootAlias)
-	for _, j := range rootJoins {
-		rootInnerSB.WriteString(" ")
-		rootInnerSB.WriteString(j)
-	}
+	// Build the root inner query (with ORDER BY/LIMIT) as a CTE. This avoids
+	// ORDER BY inside UNION ALL which SQLite doesn't allow. The root source is
+	// either the objects table or — for spec.root=clusters — the clusters
+	// table projected into the object row shape; both yield a root_objects CTE
+	// with the same columns, so the relation BFS below is identical.
+	var rootInnerSQL, countSQL string
+	var allArgs, countArgs []any
+	if spec.Root == v1alpha1.RootClusters {
+		rootInnerSQL, allArgs, countSQL, countArgs = g.buildClusterRootCTE(spec, rootAlias)
+	} else {
+		rootWhere, rootArgs, rootJoins, err := g.buildRootClauses(spec, rootAlias)
+		if err != nil {
+			return nil, err
+		}
+		var rootInnerSB strings.Builder
+		rootInnerSB.WriteString("SELECT * FROM objects ")
+		rootInnerSB.WriteString(rootAlias)
+		for _, j := range rootJoins {
+			rootInnerSB.WriteString(" ")
+			rootInnerSB.WriteString(j)
+		}
 
-	allArgs := append([]any{}, rootArgs...)
+		allArgs = append([]any{}, rootArgs...)
 
-	cursorWhere, cursorArgs := g.buildCursorFilter(spec)
-	rootWhereAll := append([]string{}, rootWhere...)
-	if cursorWhere != "" {
-		rootWhereAll = append(rootWhereAll, cursorWhere)
-		allArgs = append(allArgs, cursorArgs...)
-	}
+		cursorWhere, cursorArgs := g.buildCursorFilter(spec)
+		rootWhereAll := append([]string{}, rootWhere...)
+		if cursorWhere != "" {
+			rootWhereAll = append(rootWhereAll, cursorWhere)
+			allArgs = append(allArgs, cursorArgs...)
+		}
 
-	if len(rootWhereAll) > 0 {
-		rootInnerSB.WriteString(" WHERE ")
-		rootInnerSB.WriteString(strings.Join(rootWhereAll, " AND "))
-	}
+		if len(rootWhereAll) > 0 {
+			rootInnerSB.WriteString(" WHERE ")
+			rootInnerSB.WriteString(strings.Join(rootWhereAll, " AND "))
+		}
 
-	rootInnerSB.WriteString(" ORDER BY ")
-	rootInnerSB.WriteString(strings.ReplaceAll(g.buildOrderBy(spec), "obj.", rootAlias+"."))
-	fmt.Fprintf(&rootInnerSB, " LIMIT %d", spec.Limit)
-	if spec.Page != nil && spec.Page.First > 0 && spec.Page.Cursor == "" {
-		fmt.Fprintf(&rootInnerSB, " OFFSET %d", spec.Page.First)
+		rootInnerSB.WriteString(" ORDER BY ")
+		rootInnerSB.WriteString(strings.ReplaceAll(g.buildOrderBy(spec), "obj.", rootAlias+"."))
+		fmt.Fprintf(&rootInnerSB, " LIMIT %d", spec.Limit)
+		if spec.Page != nil && spec.Page.First > 0 && spec.Page.Cursor == "" {
+			fmt.Fprintf(&rootInnerSB, " OFFSET %d", spec.Page.First)
+		}
+		rootInnerSQL = rootInnerSB.String()
+
+		// Count query (root only).
+		countArgs = make([]any, len(rootArgs))
+		copy(countArgs, rootArgs)
+		var countSB strings.Builder
+		countSB.WriteString("SELECT COUNT(*) FROM objects ")
+		countSB.WriteString(rootAlias)
+		for _, j := range rootJoins {
+			countSB.WriteString(" ")
+			countSB.WriteString(j)
+		}
+		if len(rootWhere) > 0 {
+			countSB.WriteString(" WHERE ")
+			countSB.WriteString(strings.Join(rootWhere, " AND "))
+		}
+		countSQL = countSB.String()
 	}
 
 	// The UNION ALL uses root_objects CTE as the source for l0.
@@ -171,7 +205,7 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 	rootSelect := g.buildSelectCols(rootAlias, rootProj, rootPath, false)
 
 	var rootSB strings.Builder
-	fmt.Fprintf(&rootSB, "WITH root_objects AS (%s) ", rootInnerSB.String())
+	fmt.Fprintf(&rootSB, "WITH root_objects AS (%s) ", rootInnerSQL)
 	rootSB.WriteString("SELECT ")
 	rootSB.WriteString(rootSelect)
 	rootSB.WriteString(", 0 AS level, '' AS relation_name")
@@ -439,10 +473,10 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 		// Find the end of the WITH clause: after "WITH root_objects AS (...) "
 		// Replace "WITH root_objects AS (...) SELECT" with
 		// "WITH RECURSIVE root_objects AS (...), trans_xxx AS (...) SELECT"
-		withPrefix := fmt.Sprintf("WITH root_objects AS (%s) ", rootInnerSB.String())
+		withPrefix := fmt.Sprintf("WITH root_objects AS (%s) ", rootInnerSQL)
 		rest := strings.TrimPrefix(rootSQL, withPrefix)
 		finalSB.WriteString("WITH RECURSIVE root_objects AS (")
-		finalSB.WriteString(rootInnerSB.String())
+		finalSB.WriteString(rootInnerSQL)
 		finalSB.WriteString("), ")
 		finalSB.WriteString(strings.Join(extraCTEs, ", "))
 		finalSB.WriteString(" ")
@@ -456,25 +490,10 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 	}
 	finalSB.WriteString(" ORDER BY path")
 
-	// Count query (root only).
-	countArgs := make([]any, len(rootArgs))
-	copy(countArgs, rootArgs)
-	var countSB strings.Builder
-	countSB.WriteString("SELECT COUNT(*) FROM objects ")
-	countSB.WriteString(rootAlias)
-	for _, j := range rootJoins {
-		countSB.WriteString(" ")
-		countSB.WriteString(j)
-	}
-	if len(rootWhere) > 0 {
-		countSB.WriteString(" WHERE ")
-		countSB.WriteString(strings.Join(rootWhere, " AND "))
-	}
-
 	return &GeneratedQuery{
 		SQL:          finalSB.String(),
 		Args:         allArgs,
-		CountSQL:     countSB.String(),
+		CountSQL:     countSQL,
 		CountArgs:    countArgs,
 		HasRelations: true,
 	}, nil
@@ -524,6 +543,102 @@ func (g *Generator) buildRootClauses(spec *v1alpha1.QuerySpec, alias string) ([]
 	}
 
 	return whereClauses, args, joins, nil
+}
+
+// buildClusterRootCTE builds the root inner SELECT (and its count) for a
+// clusters-rooted query. It reads the clusters table — the multicluster-runtime
+// cluster anchor — and projects it into the same 16-column object-row shape the
+// rest of the engine expects (synthesizing kind=Cluster, namespace="", etc.),
+// so the relation BFS and tree assembly treat a cluster like any other node.
+// The cluster column carries the cluster's own name, which the "members"
+// relation joins objects against. Returns (innerSQL, args, countSQL, countArgs).
+func (g *Generator) buildClusterRootCTE(spec *v1alpha1.QuerySpec, alias string) (string, []any, string, []any) {
+	where, args := g.buildClusterRootClauses(spec, alias)
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(g.clusterRootColumns(alias))
+	sb.WriteString(" FROM clusters ")
+	sb.WriteString(alias)
+	if len(where) > 0 {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(where, " AND "))
+	}
+	fmt.Fprintf(&sb, " ORDER BY %s.name ASC", alias)
+	fmt.Fprintf(&sb, " LIMIT %d", spec.Limit)
+	if spec.Page != nil && spec.Page.First > 0 && spec.Page.Cursor == "" {
+		fmt.Fprintf(&sb, " OFFSET %d", spec.Page.First)
+	}
+
+	countArgs := make([]any, len(args))
+	copy(countArgs, args)
+	var countSB strings.Builder
+	countSB.WriteString("SELECT COUNT(*) FROM clusters ")
+	countSB.WriteString(alias)
+	if len(where) > 0 {
+		countSB.WriteString(" WHERE ")
+		countSB.WriteString(strings.Join(where, " AND "))
+	}
+
+	return sb.String(), args, countSB.String(), countArgs
+}
+
+// buildClusterRootClauses generates the WHERE clauses for a clusters-rooted
+// query. The cluster filter applies directly to the clusters table (no join):
+// Name matches clusters.name (the engaged "{tenant}/{edge}" form ScopeToTenant
+// produces) and Labels match clusters.labels (where the tenant scope lives).
+func (g *Generator) buildClusterRootClauses(spec *v1alpha1.QuerySpec, alias string) ([]string, []any) {
+	var where []string
+	var args []any
+	if spec.Cluster == nil {
+		return where, args
+	}
+	if spec.Cluster.Name != "" {
+		where = append(where, alias+".name = ?")
+		args = append(args, spec.Cluster.Name)
+	}
+	for k, v := range spec.Cluster.Labels {
+		switch g.dialect {
+		case "postgres":
+			where = append(where, alias+".labels @> ?::jsonb")
+			labelsJSON, _ := json.Marshal(map[string]string{k: v})
+			args = append(args, string(labelsJSON))
+		default:
+			where = append(where, fmt.Sprintf("json_extract(%s.labels, ?) = ?", alias))
+			args = append(args, sqliteLabelPath(k), v)
+		}
+	}
+	return where, args
+}
+
+// clusterRootColumns is the SELECT column list that projects a clusters-table
+// row into the 16-column object-row shape (id..object) the engine's row scanner
+// and projection expect. id/uid/cluster/name all carry the cluster name; the
+// synthesized object embeds the cluster's status so a projection still resolves.
+func (g *Generator) clusterRootColumns(alias string) string {
+	var objExpr string
+	switch g.dialect {
+	case "postgres":
+		objExpr = fmt.Sprintf(
+			"jsonb_build_object('apiVersion','kuery.io/v1','kind','Cluster',"+
+				"'metadata',jsonb_build_object('name',%s.name),"+
+				"'status',jsonb_build_object('phase',%s.status))",
+			alias, alias)
+	default: // sqlite
+		objExpr = fmt.Sprintf(
+			"json_object('apiVersion','kuery.io/v1','kind','Cluster',"+
+				"'metadata',json_object('name',%s.name),"+
+				"'status',json_object('phase',%s.status))",
+			alias, alias)
+	}
+	return fmt.Sprintf(
+		"%s.name AS id, %s.name AS uid, %s.name AS cluster, "+
+			"'kuery.io' AS api_group, 'v1' AS api_version, 'Cluster' AS kind, 'clusters' AS resource, "+
+			"'' AS namespace, %s.name AS name, %s.labels AS labels, "+
+			"'{}' AS annotations, '[]' AS owner_refs, '[]' AS conditions, "+
+			"%s.engaged_at AS creation_ts, '' AS resource_version, "+
+			"%s AS object",
+		alias, alias, alias, alias, alias, alias, objExpr)
 }
 
 // buildProjection generates the projection SQL expression.
