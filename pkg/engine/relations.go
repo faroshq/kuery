@@ -29,6 +29,67 @@ const (
 	RelMembers = "members"
 )
 
+// RelationDirection describes how deletion impact flows along a relation, from
+// the queried (anchor) object's point of view. It is the canonical source of
+// truth for any consumer that renders or reasons about impact (the portal graph
+// arrows, the kuery_impact MCP tool) so they don't each re-derive it.
+type RelationDirection string
+
+const (
+	// DirectionUpstream: the related object is a dependency — deleting it
+	// impacts the anchor. The anchor depends on it. (owners, references,
+	// selects, namespace)
+	DirectionUpstream RelationDirection = "upstream"
+	// DirectionDownstream: the related object is in the anchor's blast radius —
+	// deleting the anchor impacts it. (descendants, selected-by, namespaced,
+	// members, events)
+	DirectionDownstream RelationDirection = "downstream"
+	// DirectionLateral: peer association with no clear deletion direction.
+	// (linked, grouped)
+	DirectionLateral RelationDirection = "lateral"
+)
+
+// RelationDirections maps each relation (base name, no "+") to its impact
+// direction. Reverse pairs sit on opposite sides — e.g. owners is the upstream
+// reverse of descendants — which is exactly what keeps a Namespace as a pod's
+// parent (it impacts the pod) rather than a child.
+var RelationDirections = map[string]RelationDirection{
+	RelOwners:      DirectionUpstream,
+	RelReferences:  DirectionUpstream,
+	RelSelects:     DirectionUpstream,
+	RelNamespace:   DirectionUpstream,
+	RelDescendants: DirectionDownstream,
+	RelSelectedBy:  DirectionDownstream,
+	RelNamespaced:  DirectionDownstream,
+	RelMembers:     DirectionDownstream,
+	RelEvents:      DirectionDownstream,
+	RelLinked:      DirectionLateral,
+	RelGrouped:     DirectionLateral,
+}
+
+// RelationReverse maps a relation to the one that traverses the same edge in
+// the opposite direction (owners↔descendants, selects↔selected-by,
+// namespace↔namespaced). Relations without a reverse (linked, grouped, members,
+// events) are absent.
+var RelationReverse = map[string]string{
+	RelOwners:      RelDescendants,
+	RelDescendants: RelOwners,
+	RelSelects:     RelSelectedBy,
+	RelSelectedBy:  RelSelects,
+	RelNamespace:   RelNamespaced,
+	RelNamespaced:  RelNamespace,
+}
+
+// DirectionOf returns the impact direction of a relation name (accepts the
+// transitive "+" form). Unknown relations default to downstream — the safe
+// "this is in my blast radius" assumption.
+func DirectionOf(name string) RelationDirection {
+	if d, ok := RelationDirections[BaseRelation(name)]; ok {
+		return d
+	}
+	return DirectionDownstream
+}
+
 // IsTransitive returns true if the relation name ends with "+".
 func IsTransitive(name string) bool {
 	return strings.HasSuffix(name, "+")
