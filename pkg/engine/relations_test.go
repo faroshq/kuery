@@ -370,6 +370,34 @@ func TestRoot_ClustersWithMembers(t *testing.T) {
 	}
 }
 
+func TestRelationDirectionMetadata(t *testing.T) {
+	// Reverse pairs must be symmetric and sit on opposite impact sides.
+	for a, b := range RelationReverse {
+		if RelationReverse[b] != a {
+			t.Errorf("reverse not symmetric: %q->%q but %q->%q", a, b, b, RelationReverse[b])
+		}
+		da, db := DirectionOf(a), DirectionOf(b)
+		if da == DirectionLateral || db == DirectionLateral {
+			t.Errorf("reverse pair %q/%q should be directional, got %q/%q", a, b, da, db)
+		}
+		if da == db {
+			t.Errorf("reverse pair %q/%q should have opposite directions, both %q", a, b, da)
+		}
+	}
+
+	// DirectionOf accepts the transitive "+" form and defaults unknowns to
+	// downstream.
+	if DirectionOf("descendants+") != DirectionDownstream {
+		t.Errorf("descendants+ should be downstream, got %q", DirectionOf("descendants+"))
+	}
+	if DirectionOf("owners+") != DirectionUpstream {
+		t.Errorf("owners+ should be upstream, got %q", DirectionOf("owners+"))
+	}
+	if DirectionOf("nonexistent") != DirectionDownstream {
+		t.Errorf("unknown relation should default downstream, got %q", DirectionOf("nonexistent"))
+	}
+}
+
 func TestRelation_Events(t *testing.T) {
 	s := setupTestStore(t)
 	deploy := makeDeployment("cluster-a", "default", "nginx", nil, ts("2025-06-01T00:00:00Z"))
